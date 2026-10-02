@@ -47,6 +47,26 @@ step() {
   return 1
 }
 
+# 先验 workflow 文件本身。语法错的 workflow 不会报错 —— GitHub 只是**从不运行它**，
+# 而界面上一切照旧，看起来像「CI 是绿的」。文件本身出错，比某条测试失败更隐蔽。
+# 所以这一条排在最前面：它要是红的，后面跑得再绿也不算数。
+check_workflow() {
+  local f="$REPO/.github/workflows/ci.yml"
+  [ -f "$f" ] || { echo "没有 .github/workflows/ci.yml —— 公开仓库上不会有 CI"; return 1; }
+  ruby -ryaml -e '
+    d = YAML.load_file(ARGV[0])
+    raise "缺少 on（那它就不会被触发）" unless d["on"] || d[true]
+    raise "缺少 jobs" unless d["jobs"].is_a?(Hash) && !d["jobs"].empty?
+    d["jobs"].each do |n, j|
+      raise "#{n} 缺 runs-on" unless j["runs-on"]
+      raise "#{n} 没有 steps" unless j["steps"].is_a?(Array) && !j["steps"].empty?
+    end
+    on = d["on"] || d[true]
+    puts "  workflow 有效：触发=#{on.keys.join(",")} · job=#{d["jobs"].keys.join(",")}"
+  ' "$f"
+}
+step "CI 配置文件本身（语法 + 会不会被触发）" check_workflow
+
 step "恒真断言扫描" python3 "$HERE/check-assertions.py"
 
 # 四个测试直接跑 node —— 本地没有 npm（CI 上有）。测试内容完全一样。
