@@ -21,15 +21,32 @@ localvault setup-dsh     # 生成 MCP 插件配置
 
 这个软件的一切设计都从这两条推出来。它们不是宣传语，是**代码里守着的**：
 
-**1. 索引是只读的。**
-它不会移动、改名、删除你的任何文件。`vault_audit` 和 `propose_organize` 只出报告 ——
+**1. 这个软件不会动你的文件。**
+它不移动、不改名、不删除你的任何东西。`vault_audit` 和 `propose_organize` 只出报告 ——
 `propose_organize` 连"往哪放"都只在你自己配了 `policy.inboxDir` 之后才敢说。
-数据库以 `file:...?mode=ro` 打开，`localvault doctor` 里有一条断言专门验证写操作被拒绝。
+
+「只读」到底指什么，分三层说 —— **这三层的答案不一样，混起来讲就是骗人**：
+
+| | 读 / 写 | 说明 |
+| --- | --- | --- |
+| **你的文件** | 只读 | 硬承诺。CLI 和 App 都不写 |
+| **它自己的索引库** `~/.localvault/` | CLI **要写** | `index` 本来就是写库。删掉这个目录等于没装过 |
+| **App 读索引库** | 只读 | 以 `file:...?mode=ro` 打开，写操作被拒绝 |
+
+那条「写操作被拒绝」的断言在 **App 自检**里（`LocalVault --selftest`），
+**不在** `localvault doctor` 里 —— `doctor` 只检查环境和可读性。
 
 **2. 索引不出这台机器。**
 零运行时依赖、零网络请求、零遥测。没有云、没有服务器、没有隧道、没有 embedding ——
-只用 Node 内置模块 + `node:sqlite`。代码里不含任何具体工作区的路径、目录名或文档名，
-换台电脑 `init` 认一下就能用。
+只用 Node 内置模块 + `node:sqlite`。
+
+「零依赖」和「零网络」都有实测支撑：24 个 `require` 目标里没有一个是第三方模块
+（只有 `node:fs/os/path/crypto/child_process/sqlite` ＋ 相对路径）；在索引进程存活期间
+用 `lsof -nP -a -p <pid> -i` 轮询，**零网络套接字**；再用猴子补丁拦 `net`/`dns`/`tls`/`http`/`https`/`fetch`
+重跑一遍，**零拦截**。
+
+至于**具体路径、目录名、文档名**：`mcp-server/` 侧确实一个都没有（测试里有一条
+「隔离性」守卫，专门断言别的主目录上搜不到开发者的词）。这条守得比较严。
 
 > 什么叫「只读」的边界：它**读**你的文件来建索引。索引库在 `~/.localvault/`，
 > 删掉它等于没装过。
@@ -90,9 +107,9 @@ localvault setup-dsh     # 生成 MCP 插件配置
 | 启动前提 | SSH 隧道 15433 通；**隧道断 = 全盘不可用** | 无前提 |
 | 进程数 | 4 个后端进程 + Electron 壳 | 0（按需 stdio 子进程） |
 | 检索 | trigram + 向量 + 文件名兜底 | LIKE 子串（中文 2 字起） |
-| 索引速度 | — | 9,435 文件 / **2.6 秒**，增量 **0.7 秒** |
-| 索引体积 | Postgres 库 | 97 MB SQLite |
-| 写操作 | 作业系统可派活 | **完全没有**（只读） |
+| 索引速度 | — | 9,443 文件 / **2.6 秒**，增量 **0.4 秒** |
+| 索引体积 | Postgres 库 | 93.6 MB SQLite |
+| 写操作 | 作业系统可派活 | **不动你的文件**（但它写自己的索引库） |
 | 给 agent 的上下文 | 需 agent 主动调工具 | 同时经 MCP `instructions` **自动进系统提示词** |
 
 **它是互补的，不是替代的。** 向量语义检索、OCR、chunk 级质量判定这些硬脑已经想透的东西，
@@ -100,7 +117,14 @@ localvault setup-dsh     # 生成 MCP 插件配置
 
 ---
 
-## 实测（2026-10-01，本机）
+## 实测（2026-10-01 快照，本机）
+
+> **这一节是一个带日期的快照，不是当前值。** 索引是活的，文件一直在变 ——
+> 下面这些数字会漂。要看你自己的，跑 `localvault doctor`。
+>
+> 已知漂移（2026-10-02 复测）：扫描 **9,887** 文件（不是 9,443）、
+> 可搜正文 **7,400 / 74.8%**（不是 7,315 / 77.5%）、`instructions` **8,300** 字节（不是 8,201）、
+> vault.db **93.6 MB**（不是 90 MB）。**只有六级梯子的分布没有漂**，因为它是判断逻辑的产物。
 
 ```
 索引根：工作区 9,333 文件 / 16.7GB    桌面 9 / 1.19GB    下载 101 / 4.49GB
@@ -171,9 +195,20 @@ instructions：8,201 字节 / 上限 32,768
 ```sh
 git clone https://github.com/qiuyiwu1989-star/localvault.git
 cd localvault/mcp-server
-npm i -g .            # 之后就有 localvault 命令了
-# 或者不装，直接：node /path/to/localvault/mcp-server/cli.js <命令>
+node cli.js init          # 最稳的一条路：不需要 npm，只要有 node
+node cli.js index
 ```
+
+装成全局命令（有 npm 的机器）：
+
+```sh
+npm i -g .                # 之后就有 localvault 命令了
+```
+
+> **诚实标注**：`node cli.js` 这条路测过；**`npm i -g .` 没有实测** ——
+> 开发这套代码的机器上根本没装 npm（只有 DSH 自带的 node）。所以第一次在别的机器上
+> `npm i -g .` 时，如果 `bin` 软链或命令名有问题，请提 issue。
+> 不想装全局也可以一直用 `node <repo>/mcp-server/cli.js <命令>`。
 
 > 发布之后会改成 `npm i -g localvault`。这一节以**实测**为准：包一旦上线，这行就换掉。
 
@@ -254,7 +289,7 @@ localvault setup-dsh                   # 或 --out <目录>
 | `refresh_index` | 增量重建（默认后台子进程，不阻塞对话） |
 
 **资源**（供 `read_mcp_resource` 按需读取）：
-`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`、
+`vault://map`（别名 `vault://overview`）、`vault://guide`、`vault://projects`、`vault://recent`、
 模板 `vault://file/{path}`。
 
 ### 上下文注入
@@ -320,7 +355,8 @@ MCP `initialize` 返回的 `instructions` 会成为系统提示词的一部分�
 ├── LICENSE                MIT
 ├── mcp-server/            零依赖的 MCP 服务器（也带 CLI）
 │   ├── server.js          stdio 入口
-│   ├── cli.js             init / setup-dsh / index / map / instructions / search / project / audit / organize / coverage / doctor / ledger
+│   ├── cli.js             init / setup-dsh / index / reindex-cache / map / instructions /
+│   │                      search / project / audit / organize / coverage / doctor / ledger
 │   ├── lib/
 │   │   ├── config.js      通用默认值（零个人路径）+ 配置加载与 v1→v2 迁移
 │   │   ├── discover.js    从磁盘推断入口文档 / 目录用途 / 台账 / 规则文档
@@ -329,6 +365,8 @@ MCP `initialize` 返回的 `instructions` 会成为系统提示词的一部分�
 │   │   ├── store.js       SQLite（node:sqlite）
 │   │   ├── indexer.js     增量索引
 │   │   ├── search.js      子串检索 + 字段权重评分 + 摘要
+│   │   ├── coverage.js    覆盖度分层（暗区按「变亮代价」分档）
+│   │   ├── util.js        共用小工具
 │   │   ├── vault.js       地图、入口文档、台账、instructions 生成
 │   │   ├── governance.js  六项只读体检 + dry-run 整理方案
 │   │   └── mcp.js         MCP 协议层（工具 / 资源 / instructions）
@@ -336,22 +374,37 @@ MCP `initialize` 返回的 `instructions` 会成为系统提示词的一部分�
 │   └── test/clean-machine.js    31 项「另一台电脑」安装测试（见下）
 ├── app/                   macOS 图形界面（SwiftUI）
 │   ├── Sources/LocalVault/    窗口 / 提炼 / 云盘 / 检索库 / 地图
-│   ├── docs/                  界面截图
+│   ├── docs/                  界面截图（含开发过程稿，约 16 MB —— 见下）
+│   ├── icon/                  图标源文件与候选稿
 │   ├── scripts_build_app.sh   构建 .app
 │   ├── scripts_make_dmg.sh    打包 .dmg
 │   ├── 首次运行.md           别的电脑上怎么装（含 Gatekeeper 说明）
 │   └── 设计契约.md           界面层的冻结约定
-├── bundle/                DSH bundle（package.json + cordis.patch.yml）
+├── bundle/                DSH bundle（package.json；cordis.patch.yml 是生成物，不在版本库）
 ├── skill/local-context-mcp/ 给 agent 的 skill（不含任何具体工作区的内容）
 └── scripts/               install-skill.sh / install-bundle.sh
 ```
 
+> **仓库里最重的是截图。** 18.1 MB 的跟踪内容里，`app/docs/` 占 16.1 MB（20 张，含若干
+> 「改版前」这类过程稿），`app/icon/` 占 1.1 MB（含 18 个候选/中间产物，
+> 其中 `AppIcon.iconset/` 10 张可以由 `.icns` 重新生成）。源码本身只有 0.3 MB。
+> 如果你只关心怎么用，这两块都可以不看。
+
 ## 测试
 
 ```sh
-cd mcp-server && npm test        # 两个测试都跑
-npm run test:clean               # 只跑「另一台电脑」测试
+cd mcp-server
+node test/smoke.js               # 95 项端到端
+node test/clean-machine.js       # 31 项「另一台电脑」
 ```
+
+> 用 `node` 直接跑，不需要 npm。`package.json` 里也有 `npm test` / `npm run test:clean`，
+> 但那是给有 npm 的机器准备的 —— **开发这套代码的机器上没有 npm**，所以
+> `npm i -g .` 这条安装路径**没有被实测过**（`node cli.js` 路径测过）。
+>
+> `smoke.js` 必须在**有 `~/Desktop` 或 `~/Downloads` 的真实 HOME** 下跑：
+> 它有一条断言要求默认索引根真实存在。用假 HOME 跑会看到
+> `✗ 零配置默认根全部真实存在 —— []`，那是环境问题不是回归。
 
 ### smoke.js —— 95 项
 
