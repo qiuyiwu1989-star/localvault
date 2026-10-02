@@ -44,7 +44,7 @@ jobs:
       # 不覆盖 HOME：这几个测试**自己**建假 HOME（这一点是被 CI 逼出来的 ——
       # smoke.js 原先偷偷依赖「跑测试的机器上恰好有 ~/Desktop」，在空 HOME 上红过两条）。
       # 既然每个测试自带环境，就不该也不需要在这里替它们造。
-      - name: 测试
+      - name: 全部测试
         working-directory: mcp-server
         run: npm test
 

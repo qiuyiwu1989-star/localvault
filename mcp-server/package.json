@@ -26,7 +26,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node test/ignore-lists.js && node test/smoke.js && node test/clean-machine.js && node test/upstream.js",
+    "test": "node test/ignore-lists.js && node test/smoke.js && node test/clean-machine.js && node test/upstream.js && node test/mcp-handshake.js",
     "index": "node cli.js index",
     "map": "node cli.js map",
     "doctor": "node cli.js doctor",
@@ -35,7 +35,8 @@
     "test:ignore": "node test/ignore-lists.js",
     "pack": "npm pack",
     "test:assertions": "python3 ../scripts/check-assertions.py",
-    "check": "python3 ../scripts/check-assertions.py && npm test"
+    "check": "python3 ../scripts/check-assertions.py && npm test",
+    "test:mcp": "node test/mcp-handshake.js"
   },
   "keywords": [
     "mcp",
