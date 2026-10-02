@@ -70,6 +70,20 @@ function buildIndex(cfg, db, opts) {
 
     const writer = new BatchWriter(db);
     let extracted = 0;
+    // 新增 / 更新必须分开 —— 原来这两个数被赋成**同一个值**：
+    //   filesAdded: extracted, filesUpdated: extracted
+    // 于是报告里永远写着「新增 22000、更新 22000」。它不是错的，是**没实现**，
+    // 而它看起来完全是一份统计。这种「占位符长得像数据」比缺一个字段更坏。
+    //
+    // 表里没有「首次出现」列，所以这里用扫描前的路径快照来判：不在快照里 = 新增。
+    // 只取 `gone = 0` 的行：一个曾被标记消失、这次又出现的文件算**新增**
+    // （它确实重新进入了索引），这也比把它算作「更新」更贴近事实。
+    // 一次全表 path 查询（本机约 1 万行）很便宜，放进 Set 后每文件 O(1)。
+    const knownPaths = new Set(
+      db.prepare('SELECT path FROM files WHERE gone = 0').all().map((r) => r.path),
+    );
+    let addedHere = 0;
+    let updatedHere = 0;
     let reused = 0;
 
     for (const entry of walk.entries) {
@@ -136,6 +150,9 @@ function buildIndex(cfg, db, opts) {
         }
       }
 
+      if (knownPaths.has(entry.path)) updatedHere += 1;
+      else addedHere += 1;
+
       writer.put({
         root: root.path,
         path: entry.path,
@@ -173,6 +190,8 @@ function buildIndex(cfg, db, opts) {
       files: walk.entries.length,
       extracted,
       reused,
+      added: addedHere,
+      updated: updatedHere,
       removed,
       dirs: walk.dirCount,
       skippedDirs: walk.skippedDirs,
@@ -185,8 +204,8 @@ function buildIndex(cfg, db, opts) {
       finishedAt: Date.now(),
       root: root.path,
       filesSeen: walk.entries.length,
-      filesAdded: extracted,
-      filesUpdated: extracted,
+      filesAdded: addedHere,
+      filesUpdated: updatedHere,
       filesRemoved: removed,
       dirsSeen: walk.dirCount,
       skippedDirs: walk.skippedDirs,

@@ -69,10 +69,11 @@ step "CI 配置文件本身（语法 + 会不会被触发）" check_workflow
 
 step "恒真断言扫描" python3 "$HERE/check-assertions.py"
 
-# 四个测试直接跑 node —— 本地没有 npm（CI 上有）。测试内容完全一样。
+# 测试直接跑 node —— 本地没有 npm（CI 上有）。测试内容完全一样。
+# 加新测试时**这里和 package.json 的 test 脚本都要加**，两处必须一致。
 run_tests() {
   local d="$REPO/mcp-server"
-  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network; do
+  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network scan-integrity; do
     printf '   %-15s ' "$t"
     if (cd "$d" && "$NODE" "test/$t.js" >/tmp/ci-$t.log 2>&1); then
       grep -E "^通过|通过 [0-9]+ 项" /tmp/ci-$t.log | tail -1
@@ -85,6 +86,17 @@ run_tests() {
 step "全部测试" run_tests
 
 step "Swift 编译（Release）" bash -c "cd '$REPO/app' && swift build -c release"
+
+# 跨索引器对拍：同一棵语料树，CLI 和 App 各建一次索引，逐字段比。
+#
+# 它排在 Swift 编译之后 —— 需要那个二进制。也是唯一一条**会启动 App** 的检查
+# （走 `--onboard auto` 让 App 自己建索引），所以比别的慢几秒；
+# 但它守的正是那次「两套实现各写各的、谁都不报错」的分叉，值这个时间。
+#
+# ⚠️ 它必须跑在**源码二进制**上，也要能跑在出厂产物上（`APP_BIN=...`）。
+# 发版前请额外对 dist/ 和 dmg 里的二进制各跑一次 —— 出过一次
+# 「源码修了、dist/ 没重编」，产物因此内部自相矛盾。
+step "跨索引器对拍（CLI vs App 逐字段）" sh "$HERE/cross-indexer-check.sh"
 
 # 自检那一步：造语料 → 建库 → 自检 → 比对数据目录指纹
 selftest_step() {

@@ -69,6 +69,20 @@ function openDatabase(dbPath) {
   const { DatabaseSync } = require('node:sqlite');
   ensureDir(path.dirname(dbPath));
   const db = new DatabaseSync(dbPath);
+  // ⚠️ 顺序要紧：**先设 busy_timeout，再切 WAL。**
+  //
+  // 反了没用 —— 实测过。按「先 WAL 后 timeout」写，3 个并发 `cli.js index`
+  // 仍有一个崩在 `PRAGMA journal_mode = WAL` 上：那一句自己也要拿锁，
+  // 而它跑在超时生效**之前**，所以是立刻失败（原始崩溃栈就指向这一行）。
+  //
+  // 为什么要有 timeout：实测 3 个并发 index，2 个以 `database is locked` 栈回溯退出。
+  // 而 App 侧**一直有这个设置**（`VaultIndexer.swift:158`，
+  // 那里的注释还写着「busy_timeout 是这里加的」）—— 也就是这是已知的，
+  // 只是没补到 CLI 上。同一个库、两个入口，一个会等、一个会崩。
+  //
+  // 5000ms 与 App 侧一致：两边取值必须一样，否则「改用 App」和「改用 CLI」
+  // 会得到不同的行为。
+  db.exec('PRAGMA busy_timeout = 5000;');
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA synchronous = NORMAL;');
   db.exec('PRAGMA temp_store = MEMORY;');
