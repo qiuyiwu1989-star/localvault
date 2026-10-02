@@ -469,7 +469,7 @@ private struct DriveSyncNotice: View {
                         .captionText()
                     Text("① 存哪 —— 用你已有的 COS，不新造一套。")
                         .faintText()
-                    Text("② 脱敏边界 —— yingnao-core 的 969 个身份证号已定永久隔离。")
+                    Text("② 脱敏边界 —— 哪些内容允许出本机，得由你先定规则；本机 config 里那份「不读的名单」就是第一步。")
                         .faintText()
                 }
                 .fixedSize(horizontal: false, vertical: true)

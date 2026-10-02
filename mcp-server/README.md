@@ -21,12 +21,43 @@ node --version
 
 ---
 
+## 安装
+
+**这个包还没有发布到 npm。** `registry.npmjs.org/localvault` 与 `registry.npmmirror.com/localvault`
+**现在都是 404**，所以下面的 `npx localvault …` / `npm i -g localvault` **暂时都用不了**。
+
+包上线后这里就是两行：
+
+```sh
+npm i -g localvault   # npm 上线后可用；现在还不是
+```
+
+### 现在怎么装
+
+从源码目录装。`package.json` 里的 `bin` 会提供一个 `localvault` 命令：
+
+```sh
+cd mcp-server
+npm i -g .            # 装完就能直接用 localvault <命令>
+```
+
+不想装也可以，在 `mcp-server/` 目录里直接跑，效果一样：
+
+```sh
+node cli.js <命令>     # 例如 node cli.js init
+```
+
+> 命令在**包安装之后**叫 `localvault`；`npx localvault <命令>` 要等包发布之后才成立。
+> 本页其余部分为简洁一律写成 `localvault <命令>`。
+
+---
+
 ## 三步上手
 
 ```sh
-npx localvault init      # 认一下这台机器，写出本机配置
-npx localvault index     # 建索引
-npx localvault coverage  # 先看覆盖度，再决定值不值得治理
+localvault init      # 认一下这台机器，写出本机配置
+localvault index     # 建索引
+localvault coverage  # 先看覆盖度，再决定值不值得治理
 ```
 
 `init` 会探测 `~/Desktop` 与 `~/Downloads`，把配置写到 `~/.localvault/config.json`，
@@ -38,7 +69,7 @@ npx localvault coverage  # 先看覆盖度，再决定值不值得治理
 它是一个标准 **stdio MCP server**，服务器名 `localvault`。DSH 用户可以用内置命令一步生成挂载补丁：
 
 ```sh
-npx localvault setup-dsh
+localvault setup-dsh
 ```
 
 手工配置的话，启动命令是：
@@ -52,13 +83,13 @@ node /绝对路径/node_modules/localvault/server.js
 1. **`initialize` 返回的 `instructions`** —— 一开工就进系统提示词的「本机地图」（索引范围、权威入口文档、
    目录用途、项目台账、你写的文件管理规则摘要）。内容是**从本机文件系统实时生成**的，不是手写的。
    它有长度上限（默认 32768 字节，代码内保守截到 24000），超了会按行截断并明确标注被截断。
-2. **10 个只读工具 + 4 个资源**（见下）。
+2. **10 个只读工具 + 5 个资源**（见下）。
 
 ---
 
 ## 全部命令
 
-命令名来自 `cli.js` 的 `COMMANDS`。跑 `npx localvault help` 或 `node cli.js help` 可以列出同一份清单。
+命令名来自 `cli.js` 的 `COMMANDS`。跑 `localvault help`（或 `node cli.js help`）可以列出同一份清单。
 
 | 命令 | 摘要 |
 | --- | --- |
@@ -99,8 +130,10 @@ node /绝对路径/node_modules/localvault/server.js
 | `propose_organize` | 按你的文件管理规则生成整理方案（**dry-run，只出报告**） |
 | `refresh_index` | 索引过期或刚改过文件后重建（增量；默认后台跑，完成后再查） |
 
-同时提供 4 个资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，
-以及资源模板 `vault://file/{path}`。
+同时提供 4 个登记在册的资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，
+资源模板 `vault://file/{path}`，以及一个**未登记但可用**的别名 **`vault://overview`**
+（与 `vault://map` 走同一个 handler，返回完全相同的内容；它不出现在 `resources/list` 里，
+所以列表里看不到，但可以直接读）。
 
 ### 检索小抄
 

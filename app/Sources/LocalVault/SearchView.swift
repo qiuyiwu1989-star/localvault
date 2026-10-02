@@ -50,7 +50,51 @@ struct SearchView: View {
     @State private var skipped: Set<String> = []
     @State private var primed = false
 
-    private static let suggestions = ["项目台账", "待确认", "文件管理规则", "造物云", "永乐", "记忆"]
+    /// 建议词**从索引里推**，不写死常量。
+    ///
+    /// 以前这里硬编码了六个词（其中两个是作者的业务项目名）。后果有两层：
+    /// 那是私有信息进了公开源码；而且换台机器点这些词一条都搜不到 ——
+    /// 越点越像工具坏了。这里改成「这个库里真有的东西」：顶层目录名。
+    /// 目录名本身就在文件路径里，所以点了**必有命中**；
+    /// 推不出来（索引是空的）就返回空数组，界面**不显示那一排**，
+    /// 而不是显示一排点了没反应的死词。
+    private var suggestions: [String] {
+        Array(topDirs.sorted { $0.1 > $1.1 }.prefix(6).map { $0.0 })
+    }
+
+    /// 建议词按字数折行 —— 顶层目录名长短差得远（「项目管理」对
+    /// 「content-distribution-desk」），一行硬塞会挤在一起变形。
+    /// 折行口径和 `FlexibleChips` 保持一致。
+    private var suggestionRows: [[String]] {
+        var rows: [[String]] = []
+        var row: [String] = []
+        var len = 0
+        for w in suggestions {
+            if len + w.count > 24, !row.isEmpty { rows.append(row); row = []; len = 0 }
+            row.append(w)
+            len += w.count + 2
+        }
+        if !row.isEmpty { rows.append(row) }
+        return rows
+    }
+
+    /// 一排可点的建议词。`suggestions` 为空时**什么都不渲染**。
+    @ViewBuilder
+    private var suggestionChips: some View {
+        VStack(alignment: .leading, spacing: Space.xxs) {
+            ForEach(Array(suggestionRows.enumerated()), id: \.offset) { _, row in
+                HStack(spacing: Space.xxs) {
+                    ForEach(row, id: \.self) { w in
+                        FilterChip(text: w, tint: Palette.accent, selected: false) {
+                            keyword = w
+                            run()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private static let timePresets: [(String, Int?)] = [
         ("不限时间", nil), ("近 7 天", 7), ("近 30 天", 30), ("近 365 天", 365),
     ]
@@ -223,11 +267,8 @@ struct SearchView: View {
                 Button("放宽筛选：清空全部条件") { clearFilters() }
                     .buttonStyle(.borderedProminent)
             } else {
-                HStack(spacing: Space.xxs) {
-                    ForEach(SearchView.suggestions, id: \.self) { w in
-                        FilterChip(text: w, tint: Palette.accent, selected: false) { keyword = w; run() }
-                    }
-                }
+                // 推不出建议词时这一排是空的 —— 那就不显示，不拿死词凑数
+                suggestionChips
             }
         }
     }
@@ -279,12 +320,12 @@ struct SearchView: View {
         }
     }
 
+    @ViewBuilder
     private var suggestionPanel: some View {
-        PanelBox("试试搜这些", subtitle: "点一下直接检索。这些词都是这个库里真有的。") {
-            HStack(spacing: Space.xxs) {
-                ForEach(SearchView.suggestions, id: \.self) { w in
-                    FilterChip(text: w, tint: Palette.accent, selected: false) { keyword = w; run() }
-                }
+        // 建议词来自索引里的顶层目录；推不出来就整块不显示
+        if !suggestions.isEmpty {
+            PanelBox("试试搜这些", subtitle: "点一下直接检索。这些词是这个索引里的顶层目录，点了**必有命中**。") {
+                suggestionChips
             }
         }
     }

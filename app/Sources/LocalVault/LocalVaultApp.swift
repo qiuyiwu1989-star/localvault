@@ -302,34 +302,80 @@ struct MissingVaultView: View {
         FileManager.default.fileExists(atPath: indexDir)
     }
 
-    private var command: String { "npx localvault init && npx localvault index" }
+    // MARK: 界面上给的命令，必须是**这台机器上真能跑**的
+    //
+    // 以前这里固定显示「先用包管理器全局装那个包，再 init + index」。
+    // 但 `localvault` 并没有发布到 npm（实测 registry.npmjs.org/localvault = 404），
+    // 那条命令对谁都不成立：装了 npm 的人拿到 404，没装的人拿到 command not found，
+    // 于是这个空状态给出的唯一下一步是坏的。
+    //
+    // 现在按这台机器的实际情况给三种答案之一；**给不出来就不编**。
+
+    /// `localvault` 在不在 PATH 上
+    private var hasLocalvault: Bool { MissingVaultView.which("localvault") != nil }
+    /// 跑 CLI 源码要用到 node
+    private var nodeOnPath: String? { MissingVaultView.which("node") }
+    /// 从 .app 往上找仓库里的 CLI 源码
+    private var cliScript: String? { MissingVaultView.findCLIScript() }
+
+    private var plan: IndexCommandPlan {
+        if hasLocalvault { return .installed }
+        if let cli = cliScript {
+            return .fromSource(script: cli, nodeMissing: nodeOnPath == nil)
+        }
+        return .unavailable
+    }
+
+    private static func which(_ tool: String) -> String? {
+        let env = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        for dir in env.split(separator: ":") where !dir.isEmpty {
+            let p = String(dir) + "/" + tool
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    /// 从 `.app` 往上找 `mcp-server/cli.js`：
+    /// 在仓库里（`app/dist/本地上下文.app`）三步就能找到；挂在 dmg 里或拷到别处
+    /// 找不到 —— 那时返回 nil，界面改用文字指路，而不是显示一条跑不通的命令。
+    private static func findCLIScript() -> String? {
+        var dir = URL(fileURLWithPath: Bundle.main.bundlePath).deletingLastPathComponent()
+        for _ in 0..<5 {
+            let candidate = dir.appendingPathComponent("mcp-server/cli.js").path
+            if FileManager.default.fileExists(atPath: candidate) { return candidate }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path { break }
+            dir = parent
+        }
+        return nil
+    }
 
     var body: some View {
         EmptyState(icon: "externaldrive.badge.questionmark",
                    title: "还没有可读的索引",
                    message: message) {
             VStack(alignment: .leading, spacing: Space.sm) {
-                Text("下一步：在终端里建一次索引")
-                    .captionText()
-
-                HStack(spacing: Space.xs) {
-                    Text(command)
-                        .pathText()
-                        .lineLimit(1)
-                        .padding(.horizontal, Space.xs)
-                        .padding(.vertical, Space.xxs)
-                        .cardSurface(radius: Radius.sm)
-                    Button {
-                        let pb = NSPasteboard.general
-                        pb.clearContents()
-                        pb.setString(command, forType: .string)
-                    } label: {
-                        Label("复制", systemImage: "doc.on.doc")
+                if let command = plan.command {
+                    Text("下一步：在终端里建一次索引")
+                        .captionText()
+                    if let pre = plan.prerequisite {
+                        Text(.init(pre))
+                            .faintText()
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .help("复制这条命令")
+                    commandBlock(command)
+                    Text(.init(plan.note))
+                        .faintText()
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("下一步：先把 CLI 准备好，再建一次索引")
+                        .captionText()
+                    Text(.init(plan.note))
+                        .faintText()
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
-                Text("建完后重启这个应用即可读到。`npx localvault doctor` 可以先自检一遍。")
+                Text("建完后重启这个应用即可读到。")
                     .faintText()
 
                 HStack(spacing: Space.sm) {
@@ -345,6 +391,74 @@ struct MissingVaultView: View {
                 }
             }
             .frame(maxWidth: Shell.readingWidth, alignment: .leading)
+        }
+    }
+
+    /// 命令块。**显示的就是复制到的** —— 所以长路径换行显示，不做截断
+    /// （截断的话屏幕上看到的和粘出来的就不是同一条命令）。
+    private func commandBlock(_ command: String) -> some View {
+        HStack(alignment: .top, spacing: Space.xs) {
+            Text(command)
+                .pathText()
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, Space.xs)
+                .padding(.vertical, Space.xxs)
+                .cardSurface(radius: Radius.sm)
+            Button {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(command, forType: .string)
+            } label: {
+                Label("复制", systemImage: "doc.on.doc")
+            }
+            .help("复制这条命令")
+        }
+    }
+}
+
+/// 这台机器上「怎么建索引」的三种实情。
+/// 把它分成三种，比写死一条命令诚实：写死的那条，对一半人是空话。
+private enum IndexCommandPlan {
+    /// PATH 上有 `localvault`
+    case installed
+    /// 没有 `localvault`，但找得到 CLI 源码；`nodeMissing` 表示这台机器还没有 node
+    case fromSource(script: String, nodeMissing: Bool)
+    /// 都没有 —— **不给命令**，指路到《首次运行.md》
+    case unavailable
+
+    var command: String? {
+        switch self {
+        case .installed:
+            return "localvault init && localvault index"
+        case .fromSource(let script, _):
+            return "node \"\(script)\" init && node \"\(script)\" index"
+        case .unavailable:
+            return nil
+        }
+    }
+
+    /// 命令之前必须先补的一步。缺 node 时**先说这一步**，
+    /// 而不是把一条会 command not found 的命令直接摆出来。
+    var prerequisite: String? {
+        switch self {
+        case .fromSource(_, true):
+            return "先补一步：CLI 要求 Node ≥ 22.5，而这台机器的 PATH 上没有 `node`。"
+        default:
+            return nil
+        }
+    }
+
+    /// 说明这条命令是哪来的 —— 用户得能判断它对自己成不成立
+    var note: String {
+        switch self {
+        case .installed:
+            return "已在这台机器的 PATH 上找到 `localvault`（它要求 Node ≥ 22.5）。"
+        case .fromSource(_, false):
+            return "这台机器上没有 `localvault` 命令 —— 它还没发布到 npm，所以没有任何包管理器安装命令可用。这里直接跑仓库里的 CLI 源码。"
+        case .fromSource(_, true):
+            return "这台机器上没有 `localvault` 命令 —— 它还没发布到 npm。装好 Node 之后，这条命令直接跑仓库里的 CLI 源码。"
+        case .unavailable:
+            return "这台机器上既没有 `localvault` 命令，也没找到 CLI 源码，或者缺少 Node（≥ 22.5）。dmg 里那份《首次运行.md》的 **1.2 节**写了怎么把 CLI 拿过来。"
         }
     }
 }
