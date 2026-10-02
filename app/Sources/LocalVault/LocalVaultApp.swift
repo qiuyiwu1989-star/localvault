@@ -26,6 +26,22 @@ enum Shell {
 struct LocalVaultApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
+    /// `--selftest` 在这里处理，**不在 `AppDelegate` 里**。
+    ///
+    /// 为什么必须提前到 `init()`：`--selftest` 的语义是「只读地验一遍索引」，
+    /// 但 `body` 一旦求值就会建出 `ContentView()`，它的 `@StateObject var session = AppSession()`
+    /// 会构造 `ClaimStore()` —— 那是**读写**打开 + `CREATE TABLE IF NOT EXISTS`。
+    /// 实测（假 HOME，只放 vault.db + config.json）：跑完 `--selftest` 会多出
+    /// 一个 28,672 字节的 `claims.db`。一个「只读自检」不该在用户机器上留文件，
+    /// 而且它会让「跑完目录内容与跑之前完全一致」这条验收标准永远不成立。
+    ///
+    /// `App.init()` 在 `body` 之前执行，所以这里 `exit()` 之后什么都不会被构造。
+    init() {
+        if CommandLine.arguments.contains("--selftest") {
+            exit(VaultStore.selfTest())
+        }
+    }
+
     var body: some Scene {
         WindowGroup("本地上下文") {
             ContentView()
@@ -42,10 +58,9 @@ struct LocalVaultApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 无头自检：不进界面，直接验证能不能读到索引、不变量是否成立
-        if CommandLine.arguments.contains("--selftest") {
-            exit(VaultStore.selfTest())
-        }
+        // 注意：`--selftest` **不在这里**处理 —— 它提前到了 `LocalVaultApp.init()`。
+        // 在这里处理的话，SwiftUI 已经建过 `ContentView()`，从而构造了 `ClaimStore()`，
+        // 会在用户的假/真 HOME 上留下一个 claims.db（详见 `LocalVaultApp.init()` 的注释）。
         // --signer <名字>：设置签字人。signed_by 不可为空，所以这个必须有办法设。
         if let i = CommandLine.arguments.firstIndex(of: "--signer") {
             let args = CommandLine.arguments

@@ -628,9 +628,15 @@ enum VaultIndexer {
             denyGlobs.contains { globMatch($0, name) }
         }
 
-        /// 默认值照 config.js 抄；**如果 `~/.localvault/config.json` 存在，就以它为准**。
+        /// 默认值照 config.js 抄；`~/.localvault/config.json` 存在时**叠加**它，不是替换。
+        ///
         /// 为什么要读它：用户可能往 `ignoredDirs` 里加了自己的目录（或改了正文上限），
         /// CLI 会照着做。App 若只认自己的默认表，同一个库就会出现两种口径。
+        ///
+        /// 为什么是**叠加**而不是替换（2026-10-02 修）：
+        /// `lib/config.js` 的 `deepMerge` 对数组是整体替换，而 CLI 的 `init` 一定会写一份
+        /// **完整快照**。替换的话，默认表此后怎么改都到不了这台机器 ——
+        /// 实测本机老配置把 SwiftPM 的 `.build/` 索引了 220 行 / 161MB，就是这么来的。
         static func load() -> Settings {
             var s = Settings(ignoredDirs: Set(defaultIgnoredDirs),
                              ignoredDirSuffixes: defaultIgnoredDirSuffixes,
@@ -640,34 +646,55 @@ enum VaultIndexer {
                              maxDepth: 24)
             guard let data = try? Data(contentsOf: VaultConfig.defaultURL),
                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return s }
-            if let v = obj["ignoredDirs"] as? [String], !v.isEmpty { s.ignoredDirs = Set(v) }
+            // 用户列表只能往默认表上加；要取消某个默认项就写 "!名字"。
+            if let v = obj["ignoredDirs"] as? [String], !v.isEmpty {
+                s.ignoredDirs = Set(Settings.mergeWithDefaults(v, defaultIgnoredDirs))
+            }
             if let v = obj["ignoredDirSuffixes"] as? [String], !v.isEmpty { s.ignoredDirSuffixes = v }
-            if let v = obj["denyRead"] as? [String], !v.isEmpty { s.denyGlobs = v }
+            if let v = obj["denyRead"] as? [String], !v.isEmpty {
+                s.denyGlobs = Settings.mergeWithDefaults(v, defaultDenyRead)
+            }
             if let v = obj["maxTextBytes"] as? Int, v > 0 { s.maxTextBytes = v }
             if let v = obj["maxStoredBodyChars"] as? Int, v > 0 { s.maxStoredBodyChars = v }
             if let v = obj["maxDepth"] as? Int, v > 0 { s.maxDepth = v }
             return s
         }
 
-        /// 与 config.js 的 DEFAULT_IGNORED_DIRS 同一份清单（顺序无关，这里是集合）
+        /// 与 `lib/config.js` 的 `mergeListDefaults` 同一条规则：
+        /// 默认项一定在，用户项追加，`!名字` 取消某个默认项，结果去重且保持默认表在前。
+        private static func mergeWithDefaults(_ userList: [String], _ defaults: [String]) -> [String] {
+            let cancelled = Set(userList.filter { $0.hasPrefix("!") }.map { String($0.dropFirst()) })
+            var out: [String] = []
+            var seen = Set<String>()
+            for x in defaults + userList {
+                if x.isEmpty || x.hasPrefix("!") { continue }
+                if cancelled.contains(x) || seen.contains(x) { continue }
+                seen.insert(x)
+                out.append(x)
+            }
+            return out
+        }
+
+        /// 与 config.js 的 DEFAULT_IGNORED_DIRS 同一份清单（顺序无关，这里是集合）。
+        /// **两份表由 `test/ignore-lists.js` 逐字比对** —— 分叉会让测试直接红。
         static let defaultIgnoredDirs = [
             "node_modules", ".git", ".svn", ".hg", ".bzr",
             "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox",
-            "dist", "build", ".next", ".nuxt", ".svelte-kit", ".output", ".turbo",
+            "dist", "build", ".build", ".next", ".nuxt", ".svelte-kit", ".output", ".turbo",
             ".parcel-cache", ".vite", ".rollup.cache", "coverage", ".nyc_output",
             "target", ".gradle", ".m2", ".cargo", ".rustup",
             ".idea", ".vs", "Pods", "Carthage", "DerivedData", ".swiftpm", ".dart_tool",
             ".cache", ".npm", ".pnpm-store", ".yarn", ".Trash", ".Trashes",
             ".terraform", ".serverless", ".aws-sam", "site-packages", ".ipynb_checkpoints",
-            ".expo", ".angular", ".parcel-cache", ".eslintcache",
+            ".expo", ".angular", ".eslintcache",
+            ".venv", "venv", "virtualenv", ".virtualenv",
             ".ssh", ".gnupg", ".kube", ".docker", ".codex", ".claude", ".dsh",
             ".zsh_sessions", ".zsh_history", ".DS_Store", "Caches", "Containers",
         ]
-        // 注意：`config.js` 的默认表里**没有 `.build`**（有 `dist`/`build`，没有 `.build`）。
-        // 所以 CLI 是真的会把 SwiftPM 的 `.build/` 索引进去的（实测本机库里 204 行），
-        // 这里绝不能"顺手"补一个 —— 那会让同一个库出现两种口径。
-        // 想让它被跳过，正确的做法是往 `config.js` 的 DEFAULT_IGNORED_DIRS 里加，
-        // 两边同时生效；`Settings.load()` 会尊重用户在 config.json 里的覆盖。
+        // 删掉了原先那条「config.js 没有 `.build`，这里绝不能顺手补」的注释 ——
+        // 它的前提是错的：向导自己建的 config.json **不带** `ignoredDirs`，
+        // 那种机器上走的正是这张表，所以「往 config.js 加就两边生效」并不成立。
+        // 现在两张表都有 `.build` / `.venv` 等，且由 `test/ignore-lists.js` 逐字比对。
 
         static let defaultIgnoredDirSuffixes = [
             ".app", ".framework", ".bundle", ".xcodeproj", ".xcworkspace",

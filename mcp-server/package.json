@@ -1,6 +1,6 @@
 {
   "name": "localvault",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "把本机文件索引成 agent 可检索的本地上下文，并提供只读的文件治理体检。零依赖，索引不出机器。",
   "type": "commonjs",
   "main": "./server.js",
@@ -26,12 +26,13 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node test/smoke.js && node test/clean-machine.js && node test/upstream.js",
+    "test": "node test/ignore-lists.js && node test/smoke.js && node test/clean-machine.js && node test/upstream.js",
     "index": "node cli.js index",
     "map": "node cli.js map",
     "doctor": "node cli.js doctor",
     "test:clean": "node test/clean-machine.js",
     "test:upstream": "node test/upstream.js",
+    "test:ignore": "node test/ignore-lists.js",
     "pack": "npm pack"
   },
   "keywords": [

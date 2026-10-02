@@ -108,9 +108,14 @@ struct OnboardingView: View {
                 Image(systemName: "sparkles")
                     .font(.title3)
                     .foregroundStyle(Palette.accent)
-                Text("先建一次索引，就能用了").sectionTitle()
+                // 续跑时不能说「先建一次索引」—— 库已经有了，用户是来补完的。
+                // 这两个说法差一个字，但对用户是两种事：一个是「从零开始」，一个是「接着上次」。
+                Text(resumingExistingLibrary ? "把上次没建完的部分补完" : "先建一次索引，就能用了")
+                    .sectionTitle()
             }
-            Text("索引 = 把你选定目录里的**文件名、路径、正文**写进一个本机数据库。之后检索、提炼、判断都从这个库读。扫描全程只读：不移动、不修改、不上传任何文件。")
+            Text(resumingExistingLibrary
+                 ? "上次索引没跑完，已经扫到的部分可以正常用，但**可能少了一大截文件**。这一步会接着上次没扫到的目录往下补，**不用删库重来**。扫描全程只读：不移动、不修改、不上传任何文件。"
+                 : "索引 = 把你选定目录里的**文件名、路径、正文**写进一个本机数据库。之后检索、提炼、判断都从这个库读。扫描全程只读：不移动、不修改、不上传任何文件。")
                 .faintText()
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -227,7 +232,10 @@ struct OnboardingView: View {
     // ② 建立中
 
     private var runningStep: some View {
-        PanelBox("正在建立索引", subtitle: "第一次可能要几十秒到几分钟，取决于选了多少文件。") {
+        PanelBox("正在建立索引",
+                 subtitle: resumingExistingLibrary
+                     ? "接着上次没扫到的目录往下补。可能要几十秒到几分钟，取决于还剩多少。"
+                     : "第一次可能要几十秒到几分钟，取决于选了多少文件。") {
             VStack(alignment: .leading, spacing: Space.sm) {
                 HStack(alignment: .top, spacing: Space.sm) {
                     MetricTile(title: "已扫描",

@@ -71,21 +71,60 @@ function readXdgUserDirs(home, env) {
 
 /**
  * 按目录名整体跳过的机器生成目录。只列确定性噪声，
- * 名字有歧义的（out/tmp/vendor/env）不列，避免漏掉真实资料。
+ * 名字有歧义的（out/tmp/vendor）不列，避免漏掉真实资料。
+ *
+ * **这份表必须与 `app/Sources/LocalVault/VaultIndexer.swift` 的 `defaultIgnoredDirs`
+ * 逐字一致。** 两边各有一份、都真的在用：
+ * - CLI 走这张表；
+ * - App 在 config.json **没有** `ignoredDirs` 时走它自己那张
+ *   （向导自己建的配置就是这种情况 —— 它只拥有 version/dataDir/roots/primaryRoot）。
+ *
+ * 曾经这里写着「往 config.js 加，两边同时生效」—— 那是错的：向导建的配置不带
+ * `ignoredDirs`，Swift 用的是自己那张硬编码表，config.js 改它一点都影响不到。
+ * 现在由 `test/ignore-lists.js` 逐字比对两张表，分叉会直接让测试红。
  */
 const DEFAULT_IGNORED_DIRS = [
   'node_modules', '.git', '.svn', '.hg', '.bzr',
   '__pycache__', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', '.nox',
-  'dist', 'build', '.next', '.nuxt', '.svelte-kit', '.output', '.turbo',
+  'dist', 'build', '.build', '.next', '.nuxt', '.svelte-kit', '.output', '.turbo',
   '.parcel-cache', '.vite', '.rollup.cache', 'coverage', '.nyc_output',
   'target', '.gradle', '.m2', '.cargo', '.rustup',
   '.idea', '.vs', 'Pods', 'Carthage', 'DerivedData', '.swiftpm', '.dart_tool',
   '.cache', '.npm', '.pnpm-store', '.yarn', '.Trash', '.Trashes',
   '.terraform', '.serverless', '.aws-sam', 'site-packages', '.ipynb_checkpoints',
-  '.expo', '.angular', '.parcel-cache', '.eslintcache',
+  '.expo', '.angular', '.eslintcache',
+  '.venv', 'venv', 'virtualenv', '.virtualenv',
   '.ssh', '.gnupg', '.kube', '.docker', '.codex', '.claude', '.dsh',
   '.zsh_sessions', '.zsh_history', '.DS_Store', 'Caches', 'Containers',
 ];
+
+/**
+ * 把默认表叠加到用户列表上。
+ *
+ * 起因（2026-10-02，实测）：`deepMerge` 对**数组是整体替换**，
+ * 而 CLI 的 `init` 一定会往 config.json 写一份**完整快照**。
+ * 于是默认表此后怎么改都到不了这台机器 —— 新版本补的忽略项对老用户永远不生效。
+ * 实测本机：老配置 62 条完全盖掉默认表，SwiftPM 的 `.build/` 被索引了 220 行 / 161MB。
+ *
+ * 规则：默认项**一定生效**（它们是「机器生成的噪声」，不是内容）；用户**只能加**；
+ * 要取消某个默认项，在数组里写 `!名字`（如 `"!build"`）。
+ * 这样「默认」才是默认，同时用户仍然拿得回控制权。
+ */
+function mergeListDefaults(userList, defaults) {
+  if (!Array.isArray(userList)) return defaults.slice();
+  const cancelled = new Set(
+    userList.filter((x) => typeof x === 'string' && x.startsWith('!')).map((x) => x.slice(1))
+  );
+  const out = [];
+  const seen = new Set();
+  for (const x of [...defaults, ...userList]) {
+    if (typeof x !== 'string' || x === '' || x.startsWith('!')) continue;
+    if (cancelled.has(x) || seen.has(x)) continue;
+    seen.add(x);
+    out.push(x);
+  }
+  return out;
+}
 
 /** 这些后缀一律是目录型 bundle，不进入。 */
 const DEFAULT_IGNORED_DIR_SUFFIXES = [
@@ -300,6 +339,14 @@ function loadConfig(overrides) {
 
   // 规范化
   cfg.version = 2;
+
+  // 两张「忽略/不读」表按**叠加**解释，不是替换。
+  // 原因见 `mergeListDefaults`：数组在 deepMerge 里是整体替换，
+  // 用户文件里那份快照会让默认表的后续修改永远到不了这台机器。
+  // 放在最末尾：env / overrides 都应用完之后，用户写的 `!名字` 也能被看到。
+  cfg.ignoredDirs = mergeListDefaults(cfg.ignoredDirs, DEFAULT_IGNORED_DIRS);
+  cfg.denyRead = mergeListDefaults(cfg.denyRead, DEFAULT_DENY_READ);
+
   cfg.roots = (cfg.roots || []).map((r, i) => {
     const obj = typeof r === 'string' ? { path: r } : { ...r };
     obj.path = expandHome(obj.path);
