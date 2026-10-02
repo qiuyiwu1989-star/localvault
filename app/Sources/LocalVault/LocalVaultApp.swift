@@ -93,6 +93,12 @@ struct ContentView: View {
 
     @State private var tab: Tab = ContentView.initialTab ?? .extract
 
+    /// 横幅上「继续建完」被点过：把首次运行向导顶上来（以**续跑**形态）。
+    /// 库不存在时才走向导那条老路（`needsOnboarding`）—— 两者不是一回事。
+    /// `--resume` 让这条入口也能被自动验收（和 `--onboard auto|enter` 同一个理由：
+    /// 横幅 → 续跑这条路不能只靠手点截图来回归）。
+    @State private var resumeRequested = ContentView.resumeOnboarding
+
     private var vault: VaultStore { session.vault }
     private var claims: ClaimStore { session.claims }
 
@@ -138,6 +144,11 @@ struct ContentView: View {
         return OnboardingAutomation(rawValue: args[i + 1])
     }
 
+    /// `--resume` —— 等价于用户点了主界面横幅上的「继续建完」：
+    /// 直接以**续跑**形态进向导（接着上次存的目录往下扫）。
+    /// 同上：不给它一个开关，这条入口就只能靠手点截图，不可回归。
+    static var resumeOnboarding: Bool { CommandLine.arguments.contains("--resume") }
+
     /// 三个板块，对应你描述的三件事。
     /// `rawValue` 是中文且**不许改** —— `--tab` 按它匹配。
     enum Tab: String, CaseIterable, Identifiable {
@@ -175,6 +186,15 @@ struct ContentView: View {
                     // 库在但打不开 → 真错误态，别拿向导糊上去
                     MissingVaultView(message: err)
                 }
+            } else if needsOnboarding || resumeRequested {
+                // 两条路进同一个向导，但形态不同：
+                //   库不存在（needsOnboarding）→ 从选目录开始
+                //   库在、只是不完整（resumeRequested）→ **续跑**：接着上次的目录往下补
+                OnboardingView(automation: ContentView.onboardingAutomation,
+                               resumingExistingLibrary: resumeRequested) {
+                    session.reopen()
+                    resumeRequested = false
+                }
             } else {
                 shell
             }
@@ -195,12 +215,14 @@ struct ContentView: View {
     // 不需要我们拿一个居中的 segmented 控件去假装导航。
 
     private var shell: some View {
-        NavigationSplitView {
-            Sidebar(tab: $tab, vault: vault)
-                .navigationSplitViewColumnWidth(min: Shell.sidebarMin,
-                                                ideal: Shell.sidebarIdeal,
-                                                max: Shell.sidebarMax)
-        } detail: {
+        VStack(spacing: 0) {
+            if !vault.indexIsComplete { incompleteBanner }
+            NavigationSplitView {
+                Sidebar(tab: $tab, vault: vault)
+                    .navigationSplitViewColumnWidth(min: Shell.sidebarMin,
+                                                    ideal: Shell.sidebarIdeal,
+                                                    max: Shell.sidebarMax)
+            } detail: {
             detail
                 .navigationTitle(tab.title)
                 .toolbar {
@@ -214,7 +236,44 @@ struct ContentView: View {
                         .help("只重新读一遍索引库；不会扫描磁盘，也不会改动任何文件")
                     }
                 }
+            }
         }
+    }
+
+    /// 索引不完整（上次没跑完）时的横幅。
+    ///
+    /// 三种状态必须分清，**不能混**：
+    ///   库不存在      → 首次运行向导
+    ///   库在但打不开  → 真错误态
+    ///   库在、能读、上次没扫完 → **能用，但必须标明不全**，并给一条补齐的路
+    ///
+    /// 不标的后果 verifier 实测过：40,001 个文件的树取消后留下 3,513 行，
+    /// 界面照样写「全部文件 3,513」「3,513 个文件已判断，全部参与了判断」——
+    /// 少了 90% 却看不出任何异常，而且用户自己修不好。
+    ///
+    /// 判据来自 `VaultStore.indexIsComplete`（`meta.last_scan_at` 在不在），
+    /// **界面不自己去读 meta 表** —— 那是索引层的口径，只该有一个来源。
+    private var incompleteBanner: some View {
+        HStack(alignment: .center, spacing: Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Palette.warning)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("这个索引不完整：上次索引没有跑完")
+                    .sectionTitle()
+                Text("已经索引到的部分可以正常检索和判断，但**可能少了一大截文件**。点「继续建完」会接着上次的目录往下补，不用删库重来。")
+                    .captionText()
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: Space.sm)
+            Button("继续建完") { resumeRequested = true }
+                .buttonStyle(.borderedProminent)
+                .help("回到首次运行向导，接着上次的目录继续建（增量续跑，已经扫过的不白扫）")
+        }
+        .padding(.horizontal, Space.md)
+        .padding(.vertical, Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Palette.warning.opacity(0.10))
+        .overlay(alignment: .bottom) { Divider() }
     }
 
     @ViewBuilder

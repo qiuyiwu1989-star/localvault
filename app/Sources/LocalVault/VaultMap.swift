@@ -121,11 +121,36 @@ struct MapPanel: View {
             }
             .animation(Motion.base, value: showRaw)
         } else {
-            PanelBox("索引地图", subtitle: "没读到地图数据，所以这一屏没有任何可以证明的东西。") {
+            PanelBox("索引地图", subtitle: "没读到地图数据。这不是「索引没建」—— 索引本身可以正常用，缺的只是这一份地图。") {
                 // 面板里不放假空状态：`EmptyState` 带 maxHeight .infinity，会撑爆面板。
-                Text(.init("读不到地图 —— 索引还没生成过地图，或者地图文件被移走了。**先让索引跑一次**，再回到这里。"))
-                    .captionText()
-                    .fixedSize(horizontal: false, vertical: true)
+                //
+                // 这里原来写的是「**先让索引跑一次**，再回到这里」—— 那是句做不到的话：
+                // App 内建的（原生）索引器**永远不写 `meta.map`**，用户跑一百次也不会变，
+                // 而「地图由建索引那一步生成」这个印象会把缺口说成用户没听话。
+                // 与自检里那条诚实的说法对齐（`VaultStore`：「原生索引器不生成它，属已知缺口」），
+                // 并且只给**真能落地的一步**。
+                VStack(alignment: .leading, spacing: Space.sm) {
+                    Text("**这份地图不由 App 内建的索引器生成**（已知缺口）：它只写索引本身（文件名 / 路径 / 正文），所以在 App 里跑多少次索引，这里都不会有地图。")
+                        .captionText()
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let cmd = CLIProbe.plan.mapCommand {
+                        Text("想要地图（以及给 agent 用的 instructions）：用 CLI 刷一次缓存 —— 它只重建这份地图，**不重扫磁盘**。")
+                            .captionText()
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let pre = CLIProbe.plan.prerequisite {
+                            Text(pre).faintText().fixedSize(horizontal: false, vertical: true)
+                        }
+                        CLICommandRow(command: cmd)
+                        Text(CLIProbe.plan.note)
+                            .faintText()
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("这台机器上没有 `localvault` 命令，App 旁边也没找到 CLI 源码。dmg 里的 `CLI/` 就是完整源码：拷到任意位置后用 `node cli.js reindex-cache` 跑一次（要求 Node ≥ 22.5）。")
+                            .captionText()
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
         }
     }

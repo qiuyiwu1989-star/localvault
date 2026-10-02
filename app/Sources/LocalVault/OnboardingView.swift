@@ -22,6 +22,12 @@ struct OnboardingView: View {
     ///   `enter` —— 在 auto 的基础上，扫完自动进主界面（用来验「进得去」）
     var automation: OnboardingAutomation? = nil
 
+    /// 从主界面那条「索引不完整」横幅点进来的：库本来就在、能读，只是上次没扫完。
+    /// 因此有两处不一样：
+    ///   ① 按钮写着「继续建完」，所以进来就**接着上次存的目录开扫**（不是新猜的范围）
+    ///   ② 取消时**必须**留一条回主界面的路 —— 否则又是一个「回不去」的死路
+    var resumingExistingLibrary: Bool = false
+
     /// 索引建好之后通知外面**重新打开索引**。
     /// 必须由外面换掉那个只读句柄：它当初是以「打不开」打开失败的，
     /// 光调 `loadOverview()` 修不好它（`db` 还是 nil）。
@@ -84,6 +90,10 @@ struct OnboardingView: View {
             // 让上面那句 `choices` 的写入先生效。
             if automation != nil {
                 DispatchQueue.main.async { start() }
+            } else if resumingExistingLibrary {
+                // 横幅上写的是「继续建完」，点进来就接着上次的目录往下扫。
+                // 扫的是哪些目录、扫到哪一条，都在「建立中」那一屏如实显示，随时可取消。
+                DispatchQueue.main.async { if !picked.isEmpty { start() } }
             }
         }
         // 关窗 / 向导被替换时别让扫描线程继续跑
@@ -243,7 +253,10 @@ struct OnboardingView: View {
                         .truncationMode(.middle)
                 }
 
-                Text("取消不会弄坏东西：已经扫到的部分是**有效但可能不完整**的索引，再点一次会接着补全（不用删库重来）。")
+                // 这句原来写的是「再点一次会接着补全」—— 那时的界面上**没有**那个按钮，
+                // 而且一旦进了主界面，App 内建的索引器不会自己接着扫：就是一句做不到的话。
+                // 现在这句与真实存在的两条路对齐：这一屏的「继续建完」，以及主界面顶部的横幅入口。
+                Text("取消不会弄坏东西：已经扫到的部分是**有效但可能不完整**的索引。App 内建的索引器不会在你进入主界面之后自己接着往下扫 —— 但主界面顶部会一直有「索引不完整 · 继续建完」的入口，随时能回来接着补。")
                     .faintText()
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -377,7 +390,12 @@ struct OnboardingView: View {
                 // 已经落了东西才给这条出口，并且如实写明它不完整。
                 if (progress?.scanned ?? 0) > 0 {
                     Button("先这样用（已扫到 \(progress?.scanned ?? 0) 条，不完整）") { onIndexed() }
-                        .help("这个索引不完整。以后想补全：删掉 vault.db 再打开 App 会重新走向导，或者用 CLI 增量跑一次。")
+                        .help("这个索引不完整。进了主界面之后，顶部会一直有「索引不完整 · 继续建完」的入口，随时能回来接着补。")
+                } else if resumingExistingLibrary {
+                    // 一条都没扫到 + 库本来就是能用的（从横幅进来的）→ **必须**能回去，
+                    // 否则这里就成了新的死路：向导进得来、出不去。
+                    Button("回到主界面") { onIndexed() }
+                        .help("库还在、还能正常用，只是仍然不完整；这次取消没有改动它。")
                 }
                 Button("继续建完") { start() }
                     .buttonStyle(.borderedProminent)
@@ -616,6 +634,17 @@ enum IndexCommandPlan {
             return "node \"\(script)\" init && node \"\(script)\" index"
         case .unavailable:
             return nil
+        }
+    }
+
+    /// 只重建「地图 + instructions」那条命令（不重扫磁盘）。
+    /// 用于索引地图面板的缺口提示 —— 那里的指引必须是**真能做到**的一步。
+    /// 注意：CLI 的 `map` 子命令**只打印、不写库**，真正写 `meta.map` 的是 `reindex-cache`。
+    var mapCommand: String? {
+        switch self {
+        case .installed:            return "localvault reindex-cache"
+        case .fromSource(let s, _): return "node \"\(s)\" reindex-cache"
+        case .unavailable:          return nil
         }
     }
 
