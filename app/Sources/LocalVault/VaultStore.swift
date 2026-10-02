@@ -141,37 +141,84 @@ final class VaultStore: ObservableObject {
     }
 
     private func open() {
-        // mode=ro —— 只读打开，写操作会被 SQLite 直接拒绝
-        let uri = "file:\(dbPath)?mode=ro"
-        var handle: OpaquePointer?
-        let rc = sqlite3_open_v2(uri, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
-        guard rc == SQLITE_OK, let h = handle else {
-            let msg = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "错误码 \(rc)"
-            if let h = handle { sqlite3_close(h) }
-            loadError = "打不开索引 \(dbPath)：\(msg)"
+        // 只读打开走**唯一入口**（后台查询的 `VaultQuery.withConnection` 也走它）。
+        // 里面已经包含两件事：真读探针（拆掉 `sqlite3_open_v2` 的「懒打开」假绿）、
+        // 以及 WAL 缺 -shm 时的 immutable 回退。为什么必须只有一处实现：
+        // 上一版把它们写在 open() 里，`VaultQuery` 那条路还在用裸 `mode=ro`，
+        // 于是 CLI 建的干净库被读成「0 个文件」—— 界面能开、数字全空，
+        // 正是我们这一轮要打掉的那种假绿，只是换了个层。
+        let (h, why) = VaultStore.openReadOnly(dbPath)
+        guard let h else {
+            // 两条路都不行：**原样**报第一次的错误，绝不静默降级成「空库」。
+            loadError = "打不开索引 \(dbPath)：\(why)"
             return
         }
         db = h
-        // 只读句柄也要等一会儿：默认 busy_timeout=0 时，恰好撞上别的进程
-        // （CLI / 向导里的原生索引器）正在 checkpoint 的那一瞬间，读会立刻拿到
-        // SQLITE_BUSY。原来所有读都只是「悄悄返回 0」，症状是界面空的；
-        // 而现在下面那条探针会把它当「打不开索引」，那就成了假故障。
-        // 2 秒足够跨过 checkpoint 窗口，又短到不会让界面看起来卡住。
-        sqlite3_busy_timeout(h, 2_000)
         loadOverview()
-        // `sqlite3_open_v2` 是**懒打开**：对一个纯文本文件它照样返回 SQLITE_OK，
-        // 「file is not a database」要等到第一次读才暴露。只信上面那个返回值的话，
-        // 一个被别的文件占位的 vault.db 会被当成「打开的、空的索引」——
-        // 界面上显示「索引里还没有文件」，用户看不出库坏了，也没有修复路径
-        // （向导只在**文件不存在**时才出，而这里文件明明在）。
-        // 所以这里真读一次（schema_version 是建库时必写的一行），
-        // 失败就把**真实原因**写进 loadError —— open() 是唯一收口点，
-        // 让所有读 loadError 的地方（界面路由、自检）都看到同一句真话。
-        if let e = VaultStore.schemaProbeError(h) {
-            loadError = "打不开索引 \(dbPath)：\(e)"
-            sqlite3_close(h)
-            db = nil
+    }
+
+    /// **只读打开的唯一入口**：App 的 store 与后台查询共用。
+    ///
+    /// 顺序：先 `mode=ro`（对写者安全，能看见 WAL 里的新数据），
+    /// 读不出来**且没有 `-wal`** 时才按 `immutable=1` 重开。
+    /// 返回的句柄保证能读 `meta` 表（两条路都探过）；nil = 两条路都读不出来。
+    /// 第二个返回值只在 nil 时有意义：`mode=ro` 那次的真实错误。
+    ///
+    /// 为什么需要回退：只读连接**不能创建 -shm**，而读 WAL 库必须有 wal-index。
+    /// 所以一个 WAL 模式的 vault.db 只要 -shm 不在（`cli.js index` 干净收尾后只剩
+    /// vault.db；或者用户按 MissingVaultView 的建议「先把 vault.db 复制一份出来」
+    /// 再复制回来），`sqlite3_open_v2` 照样返回 OK，第一条语句却 CANTOPEN ——
+    /// 连 CLI 都读得动，App 读不了。这时若 -wal 也不在，主文件就是一份**完整
+    /// checkpoint**，可以按 immutable 读：SQLite 相信它不会再变，于是不需要 wal-index。
+    ///
+    /// 竞态（回退的**已知代价**，不是「无条件正确」）：上面那个「-wal 不存在」的检查
+    /// 和真正打开之间，写者**可能刚好建出 -wal**；那一刻 immutable 让我们可能读到
+    /// **陈旧数据**。最坏是旧内容，不会是损坏 —— 我们是只读方，从不写这个库、
+    /// 也从不假装写成功。-wal 在的时候坚决不回退：那是「库正在被写」的信号，
+    /// 宁可报错，也不能把旧数据当新的给出去。
+    static func openReadOnly(_ dbPath: String,
+                             probe: String = schemaProbeSQL) -> (OpaquePointer?, String) {
+        var handle: OpaquePointer?
+        var firstError = "打不开 \(dbPath)"
+        if sqlite3_open_v2("file:\(dbPath)?mode=ro", &handle,
+                           SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+           let h = handle {
+            // 只读句柄也要等一会儿：默认 busy_timeout=0 时，恰好撞上别的进程
+            // （CLI / 向导里的原生索引器）正在 checkpoint 的那一瞬间，读会立刻拿到
+            // SQLITE_BUSY；而所有读都只是「悄悄返回 0」，症状是界面空。
+            // 2 秒足够跨过 checkpoint 窗口，又短到不会让界面看起来卡住。
+            sqlite3_busy_timeout(h, 2_000)
+            if let e = probeError(h, probe) {
+                firstError = e
+                sqlite3_close(h)
+            } else {
+                return (h, "")
+            }
+        } else {
+            firstError = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "错误码 \(firstError)"
+            if let h = handle { sqlite3_close(h) }
         }
+        guard !FileManager.default.fileExists(atPath: dbPath + "-wal"),
+              let alt = openImmutable(dbPath, probe: probe) else { return (nil, firstError) }
+        sqlite3_busy_timeout(alt, 2_000)
+        return (alt, "")
+    }
+
+    /// immutable=1 只读打开 + **再探一次**。返回 nil = 这条路也读不出来。
+    /// 调用方负责只在没有 `-wal` 时用它（原因见 `openReadOnly` 里的竞态说明）。
+    private static func openImmutable(_ dbPath: String, probe: String) -> OpaquePointer? {
+        var h: OpaquePointer?
+        let uri = "file:\(dbPath)?mode=ro&immutable=1"
+        guard sqlite3_open_v2(uri, &h, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+              let handle = h else {
+            if let h { sqlite3_close(h) }
+            return nil
+        }
+        guard probeError(handle, probe) == nil else {
+            sqlite3_close(handle)
+            return nil
+        }
+        return handle
     }
 
     deinit {
@@ -327,8 +374,39 @@ final class VaultStore: ObservableObject {
         )
     }
 
-    func files(inRel dir: String, limit: Int = 800) -> [VaultFile] {
-        let prefix = dir.hasSuffix("/") ? dir : dir + "/"
+    /// 找一个**真的没有正文**的文件（口径 `gone=0 AND length(body)=0`）。
+    /// 给自检当样本用：检索的断言不能把关键词硬编码成 "dmg" —— 那是在检验
+    /// 「用户桌面有没有 dmg 文件」，语料里没有就报红（假红）。样本从语料里取。
+    func firstBodylessFile() -> VaultFile? {
+        queryFiles(where: "gone=0 AND length(body)=0", params: [],
+                   order: "size DESC", limit: 1).first
+    }
+
+    /// 从语料里取一个**真的重复出现**的中文关键词（同一篇正文里出现 ≥ 2 次）。
+    ///
+    /// 自检原来把它硬编码成「邱懿武」：在**任何**一台不含这三个字的机器上，整节检索断言
+    /// （四十多条）会整体跳过 —— 而它检验的从来不是「这台机器有没有『邱懿武』」。
+    /// 取一个真存在、且重复出现的词，`hitCount > 1` 就是必然的，那段断言才真在跑。
+    func repeatingKeywordSample() -> String? {
+        var candidates = 0
+        for asset in fetchTextAssets(limit: 8) {
+            let body = String(fullBody(asset.id).prefix(4000))
+            var run = ""
+            var seen = Set<String>()
+            for ch in body {
+                let isCJK = ch.unicodeScalars.allSatisfy { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
+                run = isCJK ? run + String(ch) : ""
+                guard run.count == 2, !seen.contains(run) else { continue }
+                seen.insert(run)
+                candidates += 1
+                if body.components(separatedBy: run).count - 1 >= 2 { return run }
+                if candidates >= 60 { break }
+            }
+        }
+        return nil
+    }
+
+    func files(inRel dir: String, limit: Int = 800) -> [VaultFile] {        let prefix = dir.hasSuffix("/") ? dir : dir + "/"
         return queryFiles(
             where: "gone=0 AND rel LIKE ?",
             params: [prefix + "%"],
@@ -440,32 +518,38 @@ final class VaultStore: ObservableObject {
 
     // MARK: 无头自检
     //
-    /// 真读一次「建库时必写」的那一行，用来分辨「空的索引」和「根本不是数据库的占位文件」。
+    /// 默认探针用「建库时必写」的那一行，用来分辨「空的索引」和「根本不是数据库的占位文件」。
     /// 为什么不能只看 `sqlite3_open_v2` 的返回值：它是**懒打开** —— 对纯文本文件照样
     /// 返回 SQLITE_OK，「file is not a database」要等到第一次读才暴露。
-    /// 返回 nil 表示这个句柄上的索引确实可读。`open()` 与自检共用这一条探针。
-    private static func schemaProbeError(_ h: OpaquePointer) -> String? {
+    static let schemaProbeSQL = "SELECT value FROM meta WHERE key='schema_version'"
+
+    /// 在一个句柄上跑一条**只 prepare 不求值**的探针；返回 nil 表示这条语句能准备
+    /// （也就是这个文件确实是个能用的库）。返回非 nil 是那条真实错误。
+    private static func probeError(_ h: OpaquePointer, _ sql: String) -> String? {
         var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='schema_version'",
-                                    -1, &stmt, nil)
+        let rc = sqlite3_prepare_v2(h, sql, -1, &stmt, nil)
         let msg = rc == SQLITE_OK ? nil : String(cString: sqlite3_errmsg(h))
         if let stmt { sqlite3_finalize(stmt) }
         return msg
     }
 
-    /// 同上，但对一个**路径**探一次（自检用：它不想复用 App 的句柄）。
-    private static func indexProbeError(_ dbPath: String) -> String? {
-        var h: OpaquePointer?
-        let rc = sqlite3_open_v2("file:\(dbPath)?mode=ro", &h,
-                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
-        guard rc == SQLITE_OK, let handle = h else {
-            let msg = h.map { String(cString: sqlite3_errmsg($0)) } ?? "错误码 \(rc)"
-            if let h { sqlite3_close(h) }
-            return msg
+    /// 索引库的探针（`open()` 与自检共用这一条）。返回 nil 表示这个句柄上的索引确实可读。
+    private static func schemaProbeError(_ h: OpaquePointer) -> String? {
+        probeError(h, schemaProbeSQL)
+    }
+
+    /// 从一段文本里取 `length` 个**连续**汉字，用作自检的检索关键词样本。
+    /// 为什么需要它：自检原来把关键词硬编码成「项目」/ "dmg" —— 那检验的是
+    /// 「用户数据里有没有这个词」，语料里没有就报红（假红），而且它根本
+    /// 没有回答「中文 2 字起能不能搜」。关键词从语料里取，才不会喊狼来了。
+    static func firstCJKRun(_ text: String, length: Int = 2) -> String? {
+        var run = ""
+        for ch in text {
+            let isCJK = ch.unicodeScalars.allSatisfy { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
+            run = isCJK ? run + String(ch) : ""
+            if run.count >= length { return run }
         }
-        let msg = schemaProbeError(handle)
-        sqlite3_close(handle)
-        return msg
+        return nil
     }
 
     // 界面看不出来功能对不对，所以把「能不能读到数据」做成可执行的自检：
@@ -518,30 +602,28 @@ final class VaultStore: ObservableObject {
         // 如果索引文件**在**却打不开（损坏 / 权限 / 占位文件），下面第一条会红 ——
         // 所以跳过永远不等于把故障藏起来：那条红的断言就是故障本身。
         let indexFileExists = FileManager.default.fileExists(atPath: store.dbPath)
-        let dataDirExists = FileManager.default.fileExists(
-            atPath: (store.dbPath as NSString).deletingLastPathComponent)
-        // `sqlite3_open_v2` 对**任何**文件都会成功：「这不是数据库」它要等到第一次读才说。
-        // 所以只信 `loadError` 是不够的 —— 一个被别的东西占位的 vault.db 会被报成
-        // 「✓ 索引已打开」+ 后面一片跳过，看起来像"全新机器的正常状态"。
-        // 这里自己再真读一次表：读不出来就是**坏掉**，不是"还没有"。
-        let indexProbeError: String? = indexFileExists
-            ? VaultStore.indexProbeError(store.dbPath) : nil
+        // 只信 `loadError` —— 它是唯一收口点。
+        //
+        // 这里**曾经**自检再探一次表（task-21 加的），因为当时 `open()` 还只在
+        // `sqlite3_open_v2` 的返回值上设 loadError，而它是懒打开：一个被文本文件占位的
+        // vault.db 会被报成「✓ 索引已打开」+ 一片跳过。那是**旁路**：它让这条断言不再被骗，
+        // 可 loadError 仍然是假的，任何读它的地方（界面路由）照旧被骗。等 `open()` 内部
+        // 自己做了真读探针之后，这个旁路只剩坏处 —— 它用**自己的**打开方式（裸 `mode=ro`），
+        // 于是 CLI 建好、缺 `-shm` 的干净库会被它单方面判死，而 App 其实靠 `immutable=1`
+        // 回退读得好好的：一条假红。同一个「只读打开」的判定，只能有一处实现。
         let noIndex: String? = {
             if let e = store.loadError {
                 return indexFileExists
                     ? "索引打不开（\(e)）—— 见上面那条失败的断言"
                     : "还没有索引文件（全新机器，还没建过索引）"
             }
-            if let e = indexProbeError {
-                return "这个 vault.db 读不出 files 表（\(e)）—— 见上面那条失败的断言"
-            }
             return store.totalFiles == 0 ? "索引里一条文件记录都没有（还没建过索引）" : nil
         }()
         // 「还没有索引」与「索引在、却打不开 / 根本不是数据库」是两件事：
         // 前者是全新机器的常态（跳过），后者必须红。
-        check("索引已打开（只读）", store.loadError == nil && indexProbeError == nil,
-              store.loadError ?? indexProbeError ?? "",
-              unmet: (store.loadError != nil || indexProbeError != nil) && !indexFileExists
+        check("索引已打开（只读）", store.loadError == nil,
+              store.loadError ?? "",
+              unmet: store.loadError != nil && !indexFileExists
                   ? "还没有索引文件（全新机器，还没建过索引）" : nil)
         check("读到文件总数", store.totalFiles > 0, "\(store.totalFiles) 个", unmet: noIndex)
         check("读到索引体量", store.totalBytes > 0,
@@ -551,7 +633,15 @@ final class VaultStore: ObservableObject {
               unmet: noIndex)
         check("读到扫描记录（含跳过目录数）", !store.lastScan.isEmpty, "", unmet: noIndex)
         let skipped = store.lastScan.reduce(Int64(0)) { $0 + $1.skippedDirs }
-        check("口径：跳过的机器生成目录", skipped > 0, "\(skipped) 个", unmet: noIndex)
+        // 「跳过了机器生成的目录」的前提是「语料里本来就该有机器生成的目录」。
+        // 一个只有 9 个文件的桌面里一个都没有 —— 那时报红是假红（正常看起来像坏掉）。
+        // 前提不成立就走第三通道，并把缺的前提说清楚：不是「跳过数为 0」，是「语料太小」。
+        // 判据用与六级梯子同一个口径（语料下限 300），别为了消一条红另造一把尺子。
+        let machineDirPremise: String? = noIndex
+            ?? (store.totalFiles < 300
+                ? "语料太小（\(store.totalFiles) 个文件）—— 这样一堆文件里本来就不该有"
+                    + "机器生成的目录（node_modules / .git / build 之类），跳过口径无从检验" : nil)
+        check("口径：跳过的机器生成目录", skipped > 0, "\(skipped) 个", unmet: machineDirPremise)
         check("读到类型分布", !store.kinds.isEmpty, "\(store.kinds.count) 类", unmet: noIndex)
         // 地图由建索引的那一步生成，**原生索引器不写它**（已知缺口，见 CHANGELOG）。
         // 所以「索引是 App 自己建的」时这一条是「没这项东西可读」而不是缺陷。
@@ -571,8 +661,19 @@ final class VaultStore: ObservableObject {
         let many = store.fetchTextAssets(limit: 600)
         let ms = Int(Date().timeIntervalSince(t1) * 1000)
         check("界面口径 limit=600 不慢", ms < 1500, "\(many.count) 个, \(ms)ms", unmet: noAssets)
-        let hits = store.search("项目", limit: 5)
-        check("能检索中文（2 字起）", !hits.isEmpty, "命中 \(hits.count) 个", unmet: noIndex)
+        // 关键词从**语料里取**，不再硬编码「项目」。
+        // 硬编码关键词是**对用户数据内容的假设**：语料里没有这个词就报红，而它检验的
+        // 其实是「有没有『项目』这个词」，不是「中文 2 字起能不能搜」。
+        // 取一个真存在、且长度 ≥ 2 的词；取不到才跳过，并把缺的前提说清楚。
+        let corpusKeyword = assets.compactMap { store.fullBody($0.id) }
+            .compactMap { VaultStore.firstCJKRun($0, length: 2) }.first
+        let noKeyword: String? = noIndex
+            ?? (corpusKeyword == nil
+                ? "语料里找不到两个连续汉字可作关键词 —— 「2 字起能不能搜」在这台机器上无从检验"
+                : nil)
+        let hits = corpusKeyword.map { store.search($0, limit: 5) } ?? []
+        check("能检索中文（2 字起）", !hits.isEmpty,
+              corpusKeyword.map { "「\($0)」→ 命中 \(hits.count) 个" } ?? "", unmet: noKeyword)
         let firstAsset = assets.first
         check("能取完整正文", firstAsset.map { !store.fullBody($0.id).isEmpty } ?? false,
               firstAsset?.name ?? "", unmet: noAssets)
@@ -659,12 +760,22 @@ final class VaultStore: ObservableObject {
             check("无正文的文件 bodyLength 为 0", denied.bodyLength == 0, denied.name)
         }
 
-        let claims = ClaimStore()
-        // 全新机器上连数据目录都没有，条陈库无处可开 —— 那是「没得检查」；
-        // 目录在**却**打不开，才是真故障，仍然红。
-        check("条陈库可用", claims.error == nil, claims.error ?? "",
-              unmet: (claims.error != nil && !dataDirExists)
-                  ? "数据目录还不存在（全新机器，还没建过索引），条陈库无处可开" : nil)
+        // 真实条陈库只能**只读**碰。
+        //
+        // 这里原来是 `let claims = ClaimStore()` —— 而 `ClaimStore.init` 是**读写**打开
+        // 并跑 `CREATE TABLE IF NOT EXISTS`。在真实 HOME 上跑一次自检，就等于让「只读自检」
+        // 去写用户的真实数据：今天侥幸没写（schema 没变，SQLite 不动文件），但哪天 schema
+        // 一改，自检就会顺手迁移真实库。自检对真实数据只读，不能靠运气。
+        // 现在：文件不在就是「还没有条陈库」（跳过，且**不创建**），在就用只读句柄真读一次。
+        let claimsPath = ((VaultConfig.defaultDBPath as NSString).deletingLastPathComponent as NSString)
+            .appendingPathComponent("claims.db")
+        let claimsExists = FileManager.default.fileExists(atPath: claimsPath)
+        let claimsError = claimsExists
+            ? VaultStore.openReadOnly(claimsPath, probe: "SELECT count(*) FROM claims").1 : ""
+        check("条陈库可用（只读打开）", !claimsExists || claimsError.isEmpty,
+              claimsExists ? claimsError : "还没有条陈库",
+              unmet: !claimsExists
+                  ? "还没有条陈库（全新机器，还没写过条陈）—— 这不是「打不开」，自检也不会去建它" : nil)
 
         // 全部在**临时库**上测，绝不碰真实条陈数据
         let tmpDir = FileManager.default.temporaryDirectory
@@ -725,12 +836,22 @@ final class VaultStore: ObservableObject {
         // 原来写作 `check("分类：\(tb.rawValue)", true, "\(n) 个")` —— 永远不可能红，
         // 等于用 6 行「✓」冒充了六级梯子的覆盖率。现在写成 `n > 0`：
         // 哪一级塌成空集，哪一级当场变红（分级退化 = 这个工具最值钱的部分坏了）。
+        //
+        // 「每一级都必须有文件」这个前提只在**语料够丰富**时成立：CLI 刚在一个只有
+        // 9 个文件的桌面上建好库时，某几级为空是正常的 —— 那时报红就是喊狼来了。
+        // 前提不成立就按第三通道跳过（不是通过，也不是失败）。阈值取 300：
+        // 本机真实语料 9841，远在其上；比它小的语料本来也说明不了「六级是否都该出现」。
+        let ladderCorpusFloor = 300
+        let thinCorpus: String? = noIndex
+            ?? (all.count < ladderCorpusFloor
+                ? "语料太小（\(all.count) 个文件）—— 六级是否都出现，要够丰富的一堆文件才说明得了问题"
+                : nil)
         let levelCounts: [(Triage, Int)] = Triage.allCases.map { tb in
             (tb, triaged.filter { $0.triage == tb }.count)
         }
         for (tb, n) in levelCounts {
             check("分类：\(tb.rawValue)（这一级在真实索引里必须有文件）", n > 0,
-                  "\(n) 个", unmet: noIndex)
+                  "\(n) 个", unmet: thinCorpus)
         }
         // 六级之和 = 被判断的文件总数。它守的不是 triage 本身（那由「分类：完成」守），
         // 而是**上面这个直方图的算法**：谓词写错（多一个 / 少一个条件）时，
@@ -843,7 +964,7 @@ final class VaultStore: ObservableObject {
         check("分类：每一级在真实数据里都有文件",
               Triage.allCases.allSatisfy { tb in triaged.contains { $0.triage == tb } },
               Triage.allCases.map { tb in "\(tb.rawValue)=\(triaged.filter { $0.triage == tb }.count)" }.joined(separator: " "),
-              unmet: noIndex)
+              unmet: thinCorpus)
 
         // ── 六级梯子：顺序 + 每级各由什么证据定 ─────────────────────
         check("梯子：rank 从 0 连续到 5，没有跳号",
@@ -920,12 +1041,23 @@ final class VaultStore: ObservableObject {
               mc.last?.0 == mfmt.string(from: Date()), mc.last?.0 ?? "", unmet: noIndex)
 
         // ── 检索：片段 / 命中位置 / 相关度 / 筛选 ──
-        let searchHits = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武", limit: 40)
-        // 检索这一节的前提是「这个词在这个索引里有命中」。0 条命中时，
+        // 关键词从语料里取（真存在且重复出现），不再硬编码「邱懿武」。
+        let searchKeyword = store.repeatingKeywordSample()
+        let searchHits = searchKeyword
+            .map { VaultQuery.searchEx(dbPath: store.dbPath, keyword: $0, limit: 40) } ?? []
+        // 检索这一节的前提是「有个真能在语料里命中的词」。取不到样本、或 0 条命中时，
         // 下面那些 `allSatisfy` 全是**空真**（空集恒真）—— 看起来一片绿，其实什么也没测。
+        // 注意这里报的是**缺什么前提**（没有可用的关键词样本），不是「你这台机器有问题」。
         let noHits: String? = noIndex
-            ?? (searchHits.isEmpty ? "检索「邱懿武」在这个索引里 0 条命中，片段/相关度/筛选都无从检查" : nil)
-        check("检索：有命中", !searchHits.isEmpty, "\(searchHits.count) 条", unmet: noIndex)
+            ?? (searchKeyword == nil
+                ? "语料里找不到「同一篇正文里出现 ≥ 2 次」的中文词可作关键词"
+                    + "—— 检索这一节（片段 / 相关度 / 筛选）在这台机器上无从检验"
+                : (searchHits.isEmpty
+                    ? "检索「\(searchKeyword ?? "")」在这个索引里 0 条命中，片段/相关度/筛选都无从检查"
+                    : nil))
+        // 前提就是「有可用的关键词样本、且真能命中」—— 两样都写在 noHits 里。
+        // 一台机器上的正文如果都短到抽不出样本，这里该跳过，不该报红。
+        check("检索：有命中", !searchHits.isEmpty, "\(searchHits.count) 条", unmet: noHits)
         check("检索：每条都带片段（否则不知道为何命中）",
               searchHits.allSatisfy { !$0.snippet.isEmpty },
               "空片段的 \(searchHits.filter { $0.snippet.isEmpty }.count) 条", unmet: noHits)
@@ -963,7 +1095,7 @@ final class VaultStore: ObservableObject {
             guard !needle.isEmpty else { return 0 }
             return max(0, haystack.lowercased().components(separatedBy: needle.lowercased()).count - 1)
         }
-        let recountKeyword = "邱懿武"
+        let recountKeyword = searchKeyword ?? ""
         let bodyHit = searchHits.first { $0.matchedIn == "正文" && $0.hitCount > 0 }
         let recounted = bodyHit.map { occurrences(of: recountKeyword, in: store.fullBody($0.file.id)) }
         check("检索：hitCount 是「出现次数」，不是相关度分（等式：重数正文 = hitCount）",
@@ -997,18 +1129,35 @@ final class VaultStore: ObservableObject {
         // 无正文文件必须也能被搜到 —— 本机有 2,202 个这种文件
         //（口径 `gone=0 AND length(body)=0`，2026-10-01 实测；
         //  按 `is_text=0` 算是 2,106 个 —— 两个口径不是一个数，别混用）
-        let byName = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "dmg", limit: 20)
+        //
+        // 关键词同样从语料里取：原来是硬编码 "dmg"。改成先找一个**真的没有正文**的文件，
+        // 拿它名字里的一段去搜 —— 样本保证存在，断言才是在检验「无正文能不能被搜到」。
+        let bodylessFile = store.firstBodylessFile()
+        let bodylessKeyword: String? = bodylessFile.flatMap { f -> String? in
+            let stem = (f.name as NSString).deletingPathExtension
+            return stem.count >= 2 ? stem : nil
+        }
+        // 前提不成立（语料里没有无正文文件）⇒ 跳过，而且原因要说清是**没有这种文件**，
+        // 不是「搜不到」——「搜不到」是故障，「没有样本」不是。
+        let noBodyless: String? = noIndex
+            ?? (bodylessFile == nil
+                ? "这个语料里没有无正文的文件（口径 gone=0 且 length(body)=0）"
+                    + "—— 无正文这个场景在这台机器上无从检验"
+                : (bodylessKeyword == nil
+                    ? "无正文文件的名字短于 2 个字，没法按文件名搜" : nil))
+        let byName = bodylessKeyword
+            .map { VaultQuery.searchEx(dbPath: store.dbPath, keyword: $0, limit: 20) } ?? []
         check("检索：无正文的文件靠文件名也能搜到",
               byName.contains { $0.matchedIn == "文件名" },
-              byName.first.map { "\($0.file.name) ← \($0.matchedIn)" } ?? "无命中",
-              unmet: noIndex)
+              byName.first.map { "「\(bodylessKeyword ?? "")」→ \($0.file.name) ← \($0.matchedIn)" } ?? "无命中",
+              unmet: noBodyless)
         // 兜底片段：这一列曾经读到越界列号、永远为空，
         // 于是这个兜底在 2,202 个无正文文件上从来没生效过。
         check("检索：无正文文件落到「一句话索引」兜底上（不是空片段）",
               byName.contains { !$0.file.isText && !$0.snippet.isEmpty },
               byName.first(where: { !$0.file.isText })
                   .map { "\($0.file.name) → \($0.snippet.prefix(40))" } ?? "没有无正文命中",
-              unmet: noIndex)
+              unmet: noBodyless)
         // J2/J3：兜底片段必须是「一句说明」，不是把 name · kind · rel 重拼一遍。
         // 断言逐项等于实现约定，任何一项改了都会失败：
         //   · 前缀「没有正文（」+ 中文类型名 —— 不许出现裸英文 kind
@@ -1022,8 +1171,8 @@ final class VaultStore: ObservableObject {
                       && !h.snippet.contains(h.file.rel)
                       && !h.snippet.contains(h.file.kind)
               },
-              bodylessHits.first.map { "\($0.file.name) → \($0.snippet)" } ?? "没有无正文命中 —— 这条断言不能空过",
-              unmet: noIndex)
+              bodylessHits.first.map { "\($0.file.name) → \($0.snippet)" } ?? "没有无正文命中",
+              unmet: noBodyless)
         // 筛选
         // 筛选断言必须**既有命中又全部合规**。
         // 只写 allSatisfy 的话，返回 0 条也能通过 —— 那是空真，等于没测。
@@ -1061,10 +1210,26 @@ final class VaultStore: ObservableObject {
               "目录 \(topDir ?? "—") → \(byDirCount) 条",
               unmet: noHits ?? (topDir == nil ? "命中里没有带目录的文件可取样" : nil))
         // 统计用 COUNT
+        // 「无正文」这两条的前提是「语料里真有不是文字的文件」。
+        // 判据用**扩展名**，不用 `is_text`/`body` —— 那两个正是被检查的列，
+        // 拿它们当前提就成了「断言自己证明自己」（按 is_text 判 premise 时，
+        // 这个列一旦坏掉，前提也跟着假掉，于是跳过、永远不红）。
+        let textExts: Set<String> = ["md", "markdown", "txt", "text", "swift", "js", "mjs", "cjs",
+                                     "ts", "tsx", "jsx", "json", "csv", "tsv", "html", "htm", "css",
+                                     "scss", "py", "rb", "go", "rs", "java", "kt", "sh", "zsh",
+                                     "yaml", "yml", "xml", "plist", "rtf", "log", "sql", "toml", "ini"]
+        // 注意 `ext` 在库里带点（实测是 ".md"），别拿它直接和集合比 —— 差一个点就会
+        // 把「纯文本文档的语料」判成「有二进制文件」，于是前提假成立、又变回一条假红。
+        let extKey: (String) -> String = { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+        let corpusHasBinary = all.contains { !textExts.contains(extKey($0.ext)) }
+        let noBinaryInCorpus: String? = noIndex
+            ?? (corpusHasBinary ? nil
+                : "这个语料里每个文件都是文本类（按扩展名看）—— 「无正文文件数」"
+                    + "和两个口径的差额在这台机器上无从检验")
         check("统计：有正文文件数用 COUNT", store.textFileCount > 0, "\(store.textFileCount) 个",
               unmet: noIndex)
         check("统计：无正文文件数", store.totalFiles - store.textFileCount > 0,
-              "\(store.totalFiles - store.textFileCount) 个", unmet: noIndex)
+              "\(store.totalFiles - store.textFileCount) 个", unmet: noBinaryInCorpus)
 
         // J4：「无正文」有两个口径，不是一个数，说哪个就必须说清是哪个。
         //   body 为空 = `gone=0 AND length(body)=0` —— 2026-10-01 实测 2,202 个
@@ -1080,7 +1245,7 @@ final class VaultStore: ObservableObject {
         check("口径：无正文有两个数（body 为空 / is_text=0），必须说清用哪个",
               bodyEmpty >= notText && notText > 0,
               "body 为空 \(bodyEmpty) 个 · is_text=0 \(notText) 个 · 差额 \(bodyEmpty - notText) 个是文字类但超限未抽取",
-              unmet: noIndex)
+              unmet: noBinaryInCorpus)
 
         // mtime 单位：索引里是毫秒。错当秒会让满屏都是"0 天前"。
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -1104,7 +1269,10 @@ final class VaultStore: ObservableObject {
         DriveStore.ensureStructure(root: tmp)
         let madeFolders = (try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []
         check("云盘：建出默认子文件夹",
-              DriveStore.defaultFolders.allSatisfy { madeFolders.contains($0) },
+              // 非空守卫：`allSatisfy` 在空集合上恒真。`defaultFolders` 现在是 3 个字面量、
+              // 不可能为空，但那要靠**看代码**才知道；写进断言才是可判定的（扫描器也才没话说）。
+              !DriveStore.defaultFolders.isEmpty
+                  && DriveStore.defaultFolders.allSatisfy { madeFolders.contains($0) },
               madeFolders.sorted().joined(separator: " / "))
 
         // 造一个源文件

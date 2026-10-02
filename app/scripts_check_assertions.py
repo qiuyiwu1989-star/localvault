@@ -161,9 +161,16 @@ def norm(s):
     return re.sub(r"\s+", "", s)
 
 
-def classify(expr, guarded_by_unmet=False):
-    """返回 (级别, 说明)；级别 red=可判定恒真/恒假, warn=空真风险, ''=没意见。"""
+def classify(expr, unmet_value=None):
+    """返回 (级别, 说明)；级别 red=可判定恒真/恒假/恒不可达, warn=空真风险, ''=没意见。
+    `unmet_value` 为 None 表示这个 check 没有 unmet: 参数；否则是 unmet: 后面的表达式文本。"""
     e = norm(expr)
+    # 恒不可达：`unmet:` 是**常量**（字符串字面量）时，check() 里 `if let unmet` 必然成立，
+    # 于是 `ok` 永远不会被求值 —— 这一行只剩「打印一条跳过」。它不是恒真，是恒不可达，
+    # 空断言的另一种变体（真实案例：`check(…, false, unmet: noWordSubject)`，那个变量
+    # 在该分支恒非 nil，于是 `false` 永不被判定）。正确写法是 skipCheck(name, reason)。
+    if unmet_value is not None and re.match(r'^".*"$', re.sub(r"\s+", " ", unmet_value).strip()):
+        return "red", f"unmet: 是常量（{unmet_value.strip()}）—— ok 永远不会被判定；应改用 skipCheck(...)"
     if TRUE_LIT.match(e):
         return "red", "字面 true —— 不可能红"
     if FALSE_LIT.match(e):
@@ -181,7 +188,7 @@ def classify(expr, guarded_by_unmet=False):
     if "allSatisfy" in expr or ".contains {" in expr:
         if re.search(r"!\s*[\w.\[\]()]*\.isEmpty\s*&&", expr):
             return "", ""                       # 表达式里自带非空守卫
-        if guarded_by_unmet:
+        if unmet_value is not None:
             return "", ""                       # 前置写在 unmet: 里（task-21 立的规矩）
         static = re.findall(r"([\w.]+)\.allSatisfy", expr)
         if static and all(s.endswith(".allCases") for s in static):
@@ -199,9 +206,12 @@ def scan(path):
         total += 1
         if len(args) < 2:
             continue
-        guarded = any(a.startswith("unmet:") for a in args[2:])
+        unmet = None
+        for a in args[2:]:
+            if a.startswith("unmet:"):
+                unmet = a[len("unmet:"):]
         exempt = "扫描器豁免" in lines[line - 1] or (line >= 2 and "扫描器豁免" in lines[line - 2])
-        level, why = classify(args[1], guarded)
+        level, why = classify(args[1], unmet)
         row = (line, args[0][:46], args[1][:62], why)
         if level == "red":
             reds.append(row)
@@ -226,8 +236,8 @@ def main(argv):
 
 
 def selftest():
-    """扫描器自测：把已知的恒真形态植入一份**副本**（绝不碰仓库里的文件），
-    确认全部被抓到；再确认 4 条反例（正常断言、注释里的 check(..., true, ...) 等）不误报。"""
+    """扫描器自测：把已知的空断言形态植入一份**副本**（绝不碰仓库里的文件），
+    确认全部被抓到；再确认反例（正常断言、注释里的写法、变量 unmet、nil）不误报。"""
     import tempfile
     src = open(DEFAULT_TARGET, encoding="utf-8").read()
     impl = """
@@ -236,11 +246,14 @@ def selftest():
         check("自测植入：常量比较", 0 == 0)
         check("自测植入：两边同名", probe.claims.count == probe.claims.count)
         check("自测植入：恒假", false)
+        check("自测植入：常量 unmet 让 ok 不可达", count > 0, "", unmet: "永远跳过")
         check("自测反例：正常断言", 1 + 1 == 2)
         check("自测反例：注释里的 check(..., true, ...) 不算", all.count > 0)
         check("自测反例：带非空守卫", !all.isEmpty && all.allSatisfy { $0.bodyLength >= 0 })
-        check("自测反例：前置写在 unmet 里", searchHits.allSatisfy { !$0.snippet.isEmpty },
-              "", unmet: "没有命中")
+        check("自测反例：前置是变量 unmet", searchHits.allSatisfy { !$0.snippet.isEmpty },
+              "", unmet: noIndex)
+        check("自测反例：unmet 为 nil 常量", all.count > 0, "", unmet: nil)
+        skipCheck("自测反例：显式跳过不是断言", "没有东西可查")
 """
     anchor = '        check("人签条陈 signed_by 非空"'
     if anchor not in src:
@@ -251,11 +264,11 @@ def selftest():
         open(p, "w").write(src.replace(anchor, impl + anchor, 1))
         total, reds, warns = scan(p)
         titles = [r[1] for r in reds]
-        want = ["字面 true", "或 true", "常量比较", "两边同名", "恒假"]
+        want = ["字面 true", "或 true", "常量比较", "两边同名", "恒假", "常量 unmet"]
         missing = [w for w in want if not any(w in t for t in titles)]
         false_pos = [t for t in titles if "反例" in t]
         caught = len([t for t in titles if "植入" in t])
-        print(f"植入 5 种恒真形态 → 抓到 {caught} 条；反例被误报 {len(false_pos)} 条（应为 0）")
+        print(f"植入 6 种空断言形态 → 抓到 {caught} 条；反例被误报 {len(false_pos)} 条（应为 0）")
         for line, title, expr, why in reds:
             print(f"  L{line}: {title} — {why}")
         ok = not missing and not false_pos

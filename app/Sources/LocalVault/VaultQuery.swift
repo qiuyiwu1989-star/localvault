@@ -13,14 +13,14 @@ import SQLite3
 enum VaultQuery {
 
     /// 开一个**只读**连接跑一段查询，结束即关。
+    ///
+    /// 打开方式必须走 `VaultStore.openReadOnly` —— **不要**在这里另写一遍 `mode=ro`。
+    /// 原因是实测出来的：CLI 干净收尾后的库是 WAL 模式、且没有 `-shm`，只读连接
+    /// 创建不了 wal-index，于是这里返回 nil、界面显示「0 个文件」，而 store 那边
+    /// 明明读到了 9 个 —— 一个能读的库被这条路读成空的。同一个「只读打开」的判定
+    /// 只允许有一处实现，否则修好一处、另一处继续制造假绿。
     private static func withConnection<T>(_ dbPath: String, _ body: (OpaquePointer) -> T) -> T? {
-        var handle: OpaquePointer?
-        let uri = "file:\(dbPath)?mode=ro"
-        guard sqlite3_open_v2(uri, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
-              let db = handle else {
-            if let handle { sqlite3_close(handle) }
-            return nil
-        }
+        guard let db = VaultStore.openReadOnly(dbPath).0 else { return nil }
         defer { sqlite3_close(db) }
         return body(db)
     }
