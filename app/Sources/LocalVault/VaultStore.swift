@@ -152,7 +152,26 @@ final class VaultStore: ObservableObject {
             return
         }
         db = h
+        // 只读句柄也要等一会儿：默认 busy_timeout=0 时，恰好撞上别的进程
+        // （CLI / 向导里的原生索引器）正在 checkpoint 的那一瞬间，读会立刻拿到
+        // SQLITE_BUSY。原来所有读都只是「悄悄返回 0」，症状是界面空的；
+        // 而现在下面那条探针会把它当「打不开索引」，那就成了假故障。
+        // 2 秒足够跨过 checkpoint 窗口，又短到不会让界面看起来卡住。
+        sqlite3_busy_timeout(h, 2_000)
         loadOverview()
+        // `sqlite3_open_v2` 是**懒打开**：对一个纯文本文件它照样返回 SQLITE_OK，
+        // 「file is not a database」要等到第一次读才暴露。只信上面那个返回值的话，
+        // 一个被别的文件占位的 vault.db 会被当成「打开的、空的索引」——
+        // 界面上显示「索引里还没有文件」，用户看不出库坏了，也没有修复路径
+        // （向导只在**文件不存在**时才出，而这里文件明明在）。
+        // 所以这里真读一次（schema_version 是建库时必写的一行），
+        // 失败就把**真实原因**写进 loadError —— open() 是唯一收口点，
+        // 让所有读 loadError 的地方（界面路由、自检）都看到同一句真话。
+        if let e = VaultStore.schemaProbeError(h) {
+            loadError = "打不开索引 \(dbPath)：\(e)"
+            sqlite3_close(h)
+            db = nil
+        }
     }
 
     deinit {
@@ -421,58 +440,154 @@ final class VaultStore: ObservableObject {
 
     // MARK: 无头自检
     //
+    /// 真读一次「建库时必写」的那一行，用来分辨「空的索引」和「根本不是数据库的占位文件」。
+    /// 为什么不能只看 `sqlite3_open_v2` 的返回值：它是**懒打开** —— 对纯文本文件照样
+    /// 返回 SQLITE_OK，「file is not a database」要等到第一次读才暴露。
+    /// 返回 nil 表示这个句柄上的索引确实可读。`open()` 与自检共用这一条探针。
+    private static func schemaProbeError(_ h: OpaquePointer) -> String? {
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='schema_version'",
+                                    -1, &stmt, nil)
+        let msg = rc == SQLITE_OK ? nil : String(cString: sqlite3_errmsg(h))
+        if let stmt { sqlite3_finalize(stmt) }
+        return msg
+    }
+
+    /// 同上，但对一个**路径**探一次（自检用：它不想复用 App 的句柄）。
+    private static func indexProbeError(_ dbPath: String) -> String? {
+        var h: OpaquePointer?
+        let rc = sqlite3_open_v2("file:\(dbPath)?mode=ro", &h,
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+        guard rc == SQLITE_OK, let handle = h else {
+            let msg = h.map { String(cString: sqlite3_errmsg($0)) } ?? "错误码 \(rc)"
+            if let h { sqlite3_close(h) }
+            return msg
+        }
+        let msg = schemaProbeError(handle)
+        sqlite3_close(handle)
+        return msg
+    }
+
     // 界面看不出来功能对不对，所以把「能不能读到数据」做成可执行的自检：
     //   `本地上下文.app/Contents/MacOS/LocalVault --selftest`
     // 这同时是「只读」的证明 —— 自检里没有任何写 vault.db 的语句。
 
     static func selfTest() -> Int32 {
         let store = VaultStore()
+        // 三通道：**通过 / 跳过 / 失败**，一个都不许合并。
+        // 为什么要有「跳过」这一路：这些断言依赖索引里的数据，在没有索引的机器
+        // （刚下的 dmg、假 HOME、另一台新 Mac）上必然为假。把它们记成失败是喊狼来了，
+        // 记成通过则是更坏的谎 —— **`0` 不等于「没检查」**。
+        // 所以走第三条通道：显式跳过 + 写明是哪条前置不成立，并在末尾汇总里点名。
+        var pass = 0
+        var skip = 0
         var fail = 0
-        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        /// `unmet` 非 nil 表示**前置不成立**：这条记为「跳过」并说出原因，`ok` 不参与判定。
+        /// 为 nil 时才真的执行断言。数据依赖的断言一律走这个参数，
+        /// 而不是把条件写成 `false` —— 那会把「这台机器还没建索引」误报成 App 的缺陷。
+        func check(_ name: String, _ ok: Bool, _ detail: String = "", unmet: String? = nil) {
+            if let unmet {
+                skip += 1
+                print("  \u{2298} \(name)  — 跳过：\(unmet)")
+                return
+            }
             print(ok ? "  \u{2713} \(name)\(detail.isEmpty ? "" : "  — \(detail)")"
                      : "  \u{2717} \(name)\(detail.isEmpty ? "" : "  — \(detail)")")
-            if !ok { fail += 1 }
+            if ok { pass += 1 } else { fail += 1 }
+        }
+        /// 只打印、不计数 —— 给**诊断直方图**用。
+        /// 为什么要有它：把诊断塞进 `check(..., true, ...)`，同一条输出就同时扮演
+        /// 「打印」和「断言」两个角色，而后者**永远不可能红** —— 空洞的断言比没有断言
+        /// 更糟，因为它冒充覆盖率（让人以为六级分类有一打断言守着，其实一条都没有）。
+        /// 拆开之后：诊断照样看得见，「通过」里不再有假货。
+        func note(_ text: String) { print("  \u{00B7} \(text)") }
+        /// 显式记一次「跳过」——**不**拿一个假谓词占位。
+        /// 用在「这里根本没东西可查」的分支上：写成 `check(..., false, unmet: x)` 看着像
+        /// 一条会红的断言，但 `unmet` 非 nil 时那个 `false` 永远不会被判定 ——
+        /// 扫描器（`scripts_check_assertions.py`）会把它当死代码抓出来，抓得对。
+        func skipCheck(_ name: String, _ reason: String) {
+            skip += 1
+            print("  \u{2298} \(name)  — 跳过：\(reason)")
         }
 
         print("本地上下文 · 只读自检")
         print("  索引：\(store.dbPath)")
 
-        check("索引已打开（只读）", store.loadError == nil, store.loadError ?? "")
-        check("读到文件总数", store.totalFiles > 0, "\(store.totalFiles) 个")
+        // 数据类断言共同的前置。打不开 / 空库都**不构成本次通过**，
+        // 但也不该记成失败：那是这台机器的状态，不是 App 的缺陷。
+        // 如果索引文件**在**却打不开（损坏 / 权限 / 占位文件），下面第一条会红 ——
+        // 所以跳过永远不等于把故障藏起来：那条红的断言就是故障本身。
+        let indexFileExists = FileManager.default.fileExists(atPath: store.dbPath)
+        let dataDirExists = FileManager.default.fileExists(
+            atPath: (store.dbPath as NSString).deletingLastPathComponent)
+        // `sqlite3_open_v2` 对**任何**文件都会成功：「这不是数据库」它要等到第一次读才说。
+        // 所以只信 `loadError` 是不够的 —— 一个被别的东西占位的 vault.db 会被报成
+        // 「✓ 索引已打开」+ 后面一片跳过，看起来像"全新机器的正常状态"。
+        // 这里自己再真读一次表：读不出来就是**坏掉**，不是"还没有"。
+        let indexProbeError: String? = indexFileExists
+            ? VaultStore.indexProbeError(store.dbPath) : nil
+        let noIndex: String? = {
+            if let e = store.loadError {
+                return indexFileExists
+                    ? "索引打不开（\(e)）—— 见上面那条失败的断言"
+                    : "还没有索引文件（全新机器，还没建过索引）"
+            }
+            if let e = indexProbeError {
+                return "这个 vault.db 读不出 files 表（\(e)）—— 见上面那条失败的断言"
+            }
+            return store.totalFiles == 0 ? "索引里一条文件记录都没有（还没建过索引）" : nil
+        }()
+        // 「还没有索引」与「索引在、却打不开 / 根本不是数据库」是两件事：
+        // 前者是全新机器的常态（跳过），后者必须红。
+        check("索引已打开（只读）", store.loadError == nil && indexProbeError == nil,
+              store.loadError ?? indexProbeError ?? "",
+              unmet: (store.loadError != nil || indexProbeError != nil) && !indexFileExists
+                  ? "还没有索引文件（全新机器，还没建过索引）" : nil)
+        check("读到文件总数", store.totalFiles > 0, "\(store.totalFiles) 个", unmet: noIndex)
         check("读到索引体量", store.totalBytes > 0,
-              ByteCountFormatter.string(fromByteCount: store.totalBytes, countStyle: .file))
-        check("读到索引根", !store.roots.isEmpty, store.roots.map(\.label).joined(separator: " / "))
-        check("读到扫描记录（含跳过目录数）", !store.lastScan.isEmpty)
+              ByteCountFormatter.string(fromByteCount: store.totalBytes, countStyle: .file),
+              unmet: noIndex)
+        check("读到索引根", !store.roots.isEmpty, store.roots.map(\.label).joined(separator: " / "),
+              unmet: noIndex)
+        check("读到扫描记录（含跳过目录数）", !store.lastScan.isEmpty, "", unmet: noIndex)
         let skipped = store.lastScan.reduce(Int64(0)) { $0 + $1.skippedDirs }
-        check("口径：跳过的机器生成目录", skipped > 0, "\(skipped) 个")
-        check("读到类型分布", !store.kinds.isEmpty, "\(store.kinds.count) 类")
-        check("读回地图原文", !store.mapText.isEmpty, "\(store.mapText.count) 字")
+        check("口径：跳过的机器生成目录", skipped > 0, "\(skipped) 个", unmet: noIndex)
+        check("读到类型分布", !store.kinds.isEmpty, "\(store.kinds.count) 类", unmet: noIndex)
+        // 地图由建索引的那一步生成，**原生索引器不写它**（已知缺口，见 CHANGELOG）。
+        // 所以「索引是 App 自己建的」时这一条是「没这项东西可读」而不是缺陷。
+        let noMap: String? = noIndex ?? (store.mapText.isEmpty
+            ? "索引里没有地图（meta.map）—— 原生索引器不生成它，属已知缺口" : nil)
+        check("读回地图原文", !store.mapText.isEmpty, "\(store.mapText.count) 字", unmet: noMap)
 
         let t0 = Date()
         let assets = store.fetchTextAssets(limit: 10)
-        check("能取文字资产", !assets.isEmpty, "取到 \(assets.count) 个, \(Int(Date().timeIntervalSince(t0)*1000))ms")
+        check("能取文字资产", !assets.isEmpty, "取到 \(assets.count) 个, \(Int(Date().timeIntervalSince(t0)*1000))ms",
+              unmet: noIndex)
+        let noAssets: String? = noIndex
+            ?? (assets.isEmpty ? "索引里取不到文字资产（limit=10）" : nil)
 
         // 界面用的是 limit=600，必须确认它不慢到肉眼可见 —— 否则 UI 会像卡住
         let t1 = Date()
         let many = store.fetchTextAssets(limit: 600)
         let ms = Int(Date().timeIntervalSince(t1) * 1000)
-        check("界面口径 limit=600 不慢", ms < 1500, "\(many.count) 个, \(ms)ms")
+        check("界面口径 limit=600 不慢", ms < 1500, "\(many.count) 个, \(ms)ms", unmet: noAssets)
         let hits = store.search("项目", limit: 5)
-        check("能检索中文（2 字起）", !hits.isEmpty, "命中 \(hits.count) 个")
-        if let f = assets.first {
-            check("能取完整正文", !store.fullBody(f.id).isEmpty, f.name)
-        }
+        check("能检索中文（2 字起）", !hits.isEmpty, "命中 \(hits.count) 个", unmet: noIndex)
+        let firstAsset = assets.first
+        check("能取完整正文", firstAsset.map { !store.fullBody($0.id).isEmpty } ?? false,
+              firstAsset?.name ?? "", unmet: noAssets)
 
         // ── 预览：正文 + 它的诚实标记 ────────────────────────────────
         // 这一组每一条都能答出「什么坏代码会让它红」：
         //   · bodyLength 没被 SELECT 出来 → 全为 0 → 第 1 条红
         //   · 有人把 substr(body,1,4000) 当成真实字数 → 第 4 条红
         //   · fullBody / bodyDetail 读错列或读错行 → 第 3 条红
-        if let f = assets.first(where: { $0.bodyLength > 0 }) {
-            check("bodyLength 取到了真实长度", f.bodyLength > 0, "\(f.name): \(f.bodyLength) 字")
-        } else {
-            check("bodyLength 取到了真实长度", false, "没有一条查询带回 length(body) —— 列没选")
-        }
+        let lengthSample = assets.first { $0.bodyLength > 0 }
+        // 采样不到 → 跳过；**采到了而 length(body) 全为 0** 仍然是硬失败（列没选出来）。
+        check("bodyLength 取到了真实长度", lengthSample != nil,
+              lengthSample.map { "\($0.name): \($0.bodyLength) 字" }
+                  ?? "没有一条查询带回 length(body) —— 列没选",
+              unmet: noAssets)
 
         // 样本要挑**会报字数**的那几级。`不看` 那级的理由只讲"为什么不看"，
         // 字数字在那里是噪音 —— 而 `fetchTextAssets` 是按 size DESC 排的，
@@ -482,6 +597,11 @@ final class VaultStore: ObservableObject {
             f.bodyLength > FileTriage.bodyPreviewChars
                 && FileTriage.triage([f], projectTopDirs: []).first?.triage != .excluded
         }
+        // 这一组的前提是「采样到一个会报字数的文件」。采不到就不检查 ——
+        // 但要在汇总里算成「未检查」，既不能悄悄消失，也不能记成通过。
+        let noWordSubject: String? = noAssets ?? (wordSubject == nil
+            ? "索引里没有「正文超过 \(FileTriage.bodyPreviewChars) 字、且会报字数」的文件可采样"
+            : nil)
         if let f = wordSubject {
             let previewCount = f.body?.count ?? 0
             check("列表里的正文确实被截到 4000 以内",
@@ -523,8 +643,10 @@ final class VaultStore: ObservableObject {
                       !r.contains("以上") && r.contains("\(exact.bodyLength)"), r)
             }
         } else {
-            check("找得到超过 4000 字、且会报字数的文件（否则上一组是空跑）", false,
-                  "没有采样到 —— 这组断言等于没跑")
+            // 没有样本 ⇒ 这一组等于没跑：走第三通道显式说清，
+            // 不拿 `false` 假装是断言（那种写法永远不会被判定）。
+            skipCheck("找得到超过 4000 字、且会报字数的文件（否则上一组是空跑）",
+                      noWordSubject ?? "没有采样到 —— 这组断言等于没跑")
         }
 
         // 不存在的 id 必须安静地返回空，不能崩 —— 卡片和详情之间有一瞬间是不同步的
@@ -538,7 +660,11 @@ final class VaultStore: ObservableObject {
         }
 
         let claims = ClaimStore()
-        check("条陈库可用", claims.error == nil, claims.error ?? "")
+        // 全新机器上连数据目录都没有，条陈库无处可开 —— 那是「没得检查」；
+        // 目录在**却**打不开，才是真故障，仍然红。
+        check("条陈库可用", claims.error == nil, claims.error ?? "",
+              unmet: (claims.error != nil && !dataDirExists)
+                  ? "数据目录还不存在（全新机器，还没建过索引），条陈库无处可开" : nil)
 
         // 全部在**临时库**上测，绝不碰真实条陈数据
         let tmpDir = FileManager.default.temporaryDirectory
@@ -546,9 +672,16 @@ final class VaultStore: ObservableObject {
         try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
         let probe = ClaimStore(path: tmpDir.appendingPathComponent("c.db").path)
 
-        // 不变量 I：signed_by 不可为空、机器与人可分
-        check("人签条陈 signed_by 非空", !probe.claims.isEmpty || true)
+        // 不变量 I：signed_by 不可为空、机器与人可分。
+        // 顺序：先写一条，再断言「已经写进去的每一条都有签名」。
+        // 原来这条排在 judge 之前、写作 `!probe.claims.isEmpty || true` —— 恒真式：
+        // 空库也打印 ✓，等于什么都没测（和当初 J1「!isEmpty || true」是同一种病）。
+        // 现在：没有条陈可检查就进「跳过」，不是恒真通过。
         probe.judge(targetType: "dir", target: "T", verdict: .archive)
+        let unsigned = probe.claims.filter { $0.signedBy.isEmpty }
+        check("人签条陈 signed_by 非空", unsigned.isEmpty,
+              "共 \(probe.claims.count) 条，无签名的 \(unsigned.count) 条",
+              unmet: probe.claims.isEmpty ? "还没有任何条陈可检查" : nil)
         let human = probe.claims.first { $0.target == "T" }
         check("人签的条陈有 signed_by", (human?.signedBy.isEmpty == false), probe.signer)
         check("人签标记为 human / L1", human?.actorType == "human" && human?.authority == "L1")
@@ -581,17 +714,32 @@ final class VaultStore: ObservableObject {
 
         // ── 主动提炼的分类逻辑（新逻辑必须有断言）──
         let all = VaultQuery.allFiles(dbPath: store.dbPath, limit: 12000)
-        check("分类：读到文件", !all.isEmpty, "\(all.count) 个")
+        check("分类：读到文件", !all.isEmpty, "\(all.count) 个", unmet: noIndex)
         let tTriage = Date()
         let triaged = FileTriage.triage(all, projectTopDirs: store.topDirNames)
         let triageMs = Int(Date().timeIntervalSince(tTriage) * 1000)
-        check("分类：完成", triaged.count == all.count, "\(triaged.count) 条, \(triageMs)ms")
-        for tb in Triage.allCases {
-            let n = triaged.filter { $0.triage == tb }.count
-            check("分类：\(tb.rawValue)", true, "\(n) 个")
+        // 这一节全都要有文件才有意义：没有文件时 `triaged.count == all.count`（0 == 0）
+        // 和 `allSatisfy`（空集为真）都会**空真通过** —— 那正是「0 被当成通过」。
+        check("分类：完成", triaged.count == all.count, "\(triaged.count) 条, \(triageMs)ms", unmet: noIndex)
+        // 每一级的文件数：**既是诊断输出，也是真断言**。
+        // 原来写作 `check("分类：\(tb.rawValue)", true, "\(n) 个")` —— 永远不可能红，
+        // 等于用 6 行「✓」冒充了六级梯子的覆盖率。现在写成 `n > 0`：
+        // 哪一级塌成空集，哪一级当场变红（分级退化 = 这个工具最值钱的部分坏了）。
+        let levelCounts: [(Triage, Int)] = Triage.allCases.map { tb in
+            (tb, triaged.filter { $0.triage == tb }.count)
         }
+        for (tb, n) in levelCounts {
+            check("分类：\(tb.rawValue)（这一级在真实索引里必须有文件）", n > 0,
+                  "\(n) 个", unmet: noIndex)
+        }
+        // 六级之和 = 被判断的文件总数。它守的不是 triage 本身（那由「分类：完成」守），
+        // 而是**上面这个直方图的算法**：谓词写错（多一个 / 少一个条件）时，
+        // 和会立刻不等于总数。
+        let judgedTotal = levelCounts.reduce(0) { $0 + $1.1 }
+        check("分类：六级之和 = 被判断的文件总数", judgedTotal == all.count,
+              "\(judgedTotal) vs \(all.count)", unmet: noIndex)
         check("分类：结论都带理由", triaged.allSatisfy { !$0.reasons.isEmpty },
-              "无理由的 \(triaged.filter { $0.reasons.isEmpty }.count) 个")
+              "无理由的 \(triaged.filter { $0.reasons.isEmpty }.count) 个", unmet: noIndex)
         // 机器命名的识别：本机 239GB 相册就是这种
         check("机器命名：纯数字串", FileTriage.isMachineNamed("1000002066.jpg"))
         check("机器命名：base64 名字", FileTriage.isMachineNamed("eyJwIjoiXC9zdG9yYWdlXC9lbXVsYXRlZFwvMFwvRENJTVwvQ2FtZXJhXC9WSURfMjAyNjA5MThf.jpg"))
@@ -669,7 +817,14 @@ final class VaultStore: ObservableObject {
             for t in triaged where t.triage == tb { by[t.infoKind.rawValue, default: 0] += 1 }
             let top = by.sorted { $0.value > $1.value }.prefix(4)
                 .map { "\($0.key)=\($0.value)" }.joined(separator: " ")
-            check("分类构成：\(tb.rawValue)", true, top)
+            let histSum = by.values.reduce(0, +)
+            let n = levelCounts.first { $0.0 == tb }?.1 ?? 0
+            // 构成直方图的**内部一致性**：各 infoKind 的计数之和必须等于该级文件数。
+            // 它守的是这一段的谓词 —— 有人给这个 `where` 多加一个条件，和就会小于 n，红。
+            // 诊断内容（top 4 构成）作为 detail 保留：「打印」和「断言」各归各位，
+            // 不再由一个 `check` 兼职。
+            check("分类构成：\(tb.rawValue)（各类型之和 = 该级文件数）", histSum == n,
+                  "\(top) · 和 \(histSum)/\(n)", unmet: noIndex)
         }
         // 噪音理由直方图 —— 定位是哪条规则吃掉了太多文件
         var reasons: [String: Int] = [:]
@@ -679,11 +834,16 @@ final class VaultStore: ObservableObject {
         let topReasons = reasons.sorted { $0.value > $1.value }.prefix(3)
             .map { "\($0.value)×\($0.key.replacingOccurrences(of: "✗ ", with: ""))" }
             .joined(separator: " / ")
-        check("没用的主要理由", true, topReasons)
+        // 诊断，不是断言：这是「不看」级理由的分布，用来定位哪条规则吃掉了太多文件。
+        // 它答不出「什么坏代码会让它失败」，所以不该出现在「通过」的计数里。
+        if noIndex == nil {
+            note("没用的主要理由：\(topReasons.isEmpty ? "（不看级没有任何 ✗ 理由）" : topReasons)")
+        }
 
         check("分类：每一级在真实数据里都有文件",
               Triage.allCases.allSatisfy { tb in triaged.contains { $0.triage == tb } },
-              Triage.allCases.map { tb in "\(tb.rawValue)=\(triaged.filter { $0.triage == tb }.count)" }.joined(separator: " "))
+              Triage.allCases.map { tb in "\(tb.rawValue)=\(triaged.filter { $0.triage == tb }.count)" }.joined(separator: " "),
+              unmet: noIndex)
 
         // ── 六级梯子：顺序 + 每级各由什么证据定 ─────────────────────
         check("梯子：rank 从 0 连续到 5，没有跳号",
@@ -739,7 +899,7 @@ final class VaultStore: ObservableObject {
         // ── 月度序列：必须连续 ──
         let mc = VaultQuery.monthlyActivity(dbPath: store.dbPath)
         check("月度序列：正好 12 个月（缺的补 0，不能只取有数据的）",
-              mc.count == 12, "\(mc.count) 个月")
+              mc.count == 12, "\(mc.count) 个月", unmet: noIndex)
         let mfmt = DateFormatter(); mfmt.locale = Locale(identifier: "en_US_POSIX")
         mfmt.dateFormat = "yyyy-MM"
         let mcal = Calendar(identifier: .gregorian)
@@ -749,26 +909,33 @@ final class VaultStore: ObservableObject {
                   let n = mcal.date(byAdding: .month, value: 1, to: d) else { contiguous = false; break }
             if mfmt.string(from: n) != mc[i + 1].0 { contiguous = false; break }
         }
+        // 序列的**形状**由函数自己生成，所以在空库上也能成立；但「这个月有多少文件」
+        // 在空库上恒为 0 —— 一律记成未检查，免得把空库的 12 个零当成通过。
         check("月度序列：相邻月份严格递增 1 个月", contiguous,
-              mc.map { $0.0 }.joined(separator: " "))
+              mc.map { $0.0 }.joined(separator: " "), unmet: noIndex)
         check("月度序列：不出现 2000 年以前的月份（哨兵 mtime）",
               mc.allSatisfy { $0.0 >= "2000-01" },
-              mc.first?.0 ?? "")
+              mc.first?.0 ?? "", unmet: noIndex)
         check("月度序列：最后一个必须是本月",
-              mc.last?.0 == mfmt.string(from: Date()), mc.last?.0 ?? "")
+              mc.last?.0 == mfmt.string(from: Date()), mc.last?.0 ?? "", unmet: noIndex)
 
         // ── 检索：片段 / 命中位置 / 相关度 / 筛选 ──
         let searchHits = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武", limit: 40)
-        check("检索：有命中", !searchHits.isEmpty, "\(searchHits.count) 条")
+        // 检索这一节的前提是「这个词在这个索引里有命中」。0 条命中时，
+        // 下面那些 `allSatisfy` 全是**空真**（空集恒真）—— 看起来一片绿，其实什么也没测。
+        let noHits: String? = noIndex
+            ?? (searchHits.isEmpty ? "检索「邱懿武」在这个索引里 0 条命中，片段/相关度/筛选都无从检查" : nil)
+        check("检索：有命中", !searchHits.isEmpty, "\(searchHits.count) 条", unmet: noIndex)
         check("检索：每条都带片段（否则不知道为何命中）",
               searchHits.allSatisfy { !$0.snippet.isEmpty },
-              "空片段的 \(searchHits.filter { $0.snippet.isEmpty }.count) 条")
+              "空片段的 \(searchHits.filter { $0.snippet.isEmpty }.count) 条", unmet: noHits)
         check("检索：命中位置都标出来了",
               searchHits.allSatisfy { ["文件名", "正文", "路径"].contains($0.matchedIn) },
               searchHits.map { $0.matchedIn }.reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
-                  .map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))
+                  .map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "), unmet: noHits)
         check("检索：按相关度降序",
-              zip(searchHits, searchHits.dropFirst()).allSatisfy { $0.score >= $1.score })
+              zip(searchHits, searchHits.dropFirst()).allSatisfy { $0.score >= $1.score }, "",
+              unmet: noHits)
 
         // ── 上面那条降序断言曾经**恒真**：score 读的是越界列，永远是 0，
         //    而 `0 >= 0` 为真。于是它掩盖了两个真故障：
@@ -778,11 +945,12 @@ final class VaultStore: ObservableObject {
         //    所以下面这几条必须能因为"值不对"而失败，而不是因为"顺序不对"。
         check("检索：score 不是恒为 0（列号没漂移）",
               searchHits.contains { $0.score > 0 },
-              "score 取值：\(Set(searchHits.map(\.score)).sorted())；全为 [0] 才是列越界")
+              "score 取值：\(Set(searchHits.map(\.score)).sorted())；全为 [0] 才是列越界",
+              unmet: noHits)
         let legal: Set<Int> = [0, 20, 40, 60, 80, 100, 120, 140, 160]
         check("检索：score 只取合法的权重和（100/40/20 的任意组合）",
               searchHits.allSatisfy { legal.contains($0.score) },
-              "越界值：\(Set(searchHits.map(\.score)).subtracting(legal))")
+              "越界值：\(Set(searchHits.map(\.score)).subtracting(legal))", unmet: noHits)
         // J1：hitCount 必须是**关键词在正文里出现的次数**。
         // 原来的断言是 `hitCount <= 5_000` —— 恒真：相关度权重和只可能是
         // 100/120/140/160，全都 ≤ 5000。它挡不住它标题里声称要挡的那件事，
@@ -801,14 +969,16 @@ final class VaultStore: ObservableObject {
         check("检索：hitCount 是「出现次数」，不是相关度分（等式：重数正文 = hitCount）",
               bodyHit != nil && recounted == bodyHit?.hitCount,
               bodyHit.map { "\($0.file.name)：hitCount=\($0.hitCount)，重数=\(recounted ?? -1)" }
-                  ?? "没有「正文」命中可重数 —— 这条断言不能空过")
+                  ?? "没有「正文」命中可重数 —— 这条断言不能空过",
+              unmet: noHits)
         // 互补的一条：确实存在「命中数 > 1 且**不可能是任何合法 score**」的值。
         // 用**全部合法 score 取值**（100/40/20 的任意组合 = 上面那个 legal 集合）来排除，
         // 而不是只用 {100,120,140,160} —— 后者会漏掉 score=40/20 的命中：
         // 实测按历史 bug 让 hitCount 读 score 列时，取值恰好是 [40, 160]，只查那四个数是抓不住的。
         check("检索：存在命中数 >1 且不可能是 score（列号漂移会被抓出来）",
               searchHits.contains { $0.hitCount > 1 && !legal.contains($0.hitCount) },
-              "hitCount 取值：\(Set(searchHits.map(\.hitCount)).sorted())；合法 score 集合：\(legal.sorted())")
+              "hitCount 取值：\(Set(searchHits.map(\.hitCount)).sorted())；合法 score 集合：\(legal.sorted())",
+              unmet: noHits)
         // 标为「正文」命中，片段里就必须真的有关键词 ——
         // 否则说明它悄悄退回了兜底语（那意味着正文片段这一路已经坏了）。
         let textHits = searchHits.filter { $0.matchedIn == "正文" }
@@ -817,10 +987,12 @@ final class VaultStore: ObservableObject {
         }
         check("检索：标为「正文」命中的片段里确实有关键词（不是兜底语）",
               !textHits.isEmpty && snippetsWithoutKeyword.isEmpty,
-              "正文命中 \(textHits.count) 条，片段里没关键词的 \(snippetsWithoutKeyword.count) 条")
+              "正文命中 \(textHits.count) 条，片段里没关键词的 \(snippetsWithoutKeyword.count) 条",
+              unmet: noHits)
         check("检索：至少有一条命中数 >1（说明确实在数出现次数）",
               searchHits.contains { $0.hitCount > 1 },
-              "最大 \(searchHits.map(\.hitCount).max() ?? 0) 次；全为 ≤1 才说明没在数出现次数")
+              "最大 \(searchHits.map(\.hitCount).max() ?? 0) 次；全为 ≤1 才说明没在数出现次数",
+              unmet: noHits)
 
         // 无正文文件必须也能被搜到 —— 本机有 2,202 个这种文件
         //（口径 `gone=0 AND length(body)=0`，2026-10-01 实测；
@@ -828,13 +1000,15 @@ final class VaultStore: ObservableObject {
         let byName = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "dmg", limit: 20)
         check("检索：无正文的文件靠文件名也能搜到",
               byName.contains { $0.matchedIn == "文件名" },
-              byName.first.map { "\($0.file.name) ← \($0.matchedIn)" } ?? "无命中")
+              byName.first.map { "\($0.file.name) ← \($0.matchedIn)" } ?? "无命中",
+              unmet: noIndex)
         // 兜底片段：这一列曾经读到越界列号、永远为空，
         // 于是这个兜底在 2,202 个无正文文件上从来没生效过。
         check("检索：无正文文件落到「一句话索引」兜底上（不是空片段）",
               byName.contains { !$0.file.isText && !$0.snippet.isEmpty },
               byName.first(where: { !$0.file.isText })
-                  .map { "\($0.file.name) → \($0.snippet.prefix(40))" } ?? "没有无正文命中")
+                  .map { "\($0.file.name) → \($0.snippet.prefix(40))" } ?? "没有无正文命中",
+              unmet: noIndex)
         // J2/J3：兜底片段必须是「一句说明」，不是把 name · kind · rel 重拼一遍。
         // 断言逐项等于实现约定，任何一项改了都会失败：
         //   · 前缀「没有正文（」+ 中文类型名 —— 不许出现裸英文 kind
@@ -848,7 +1022,8 @@ final class VaultStore: ObservableObject {
                       && !h.snippet.contains(h.file.rel)
                       && !h.snippet.contains(h.file.kind)
               },
-              bodylessHits.first.map { "\($0.file.name) → \($0.snippet)" } ?? "没有无正文命中 —— 这条断言不能空过")
+              bodylessHits.first.map { "\($0.file.name) → \($0.snippet)" } ?? "没有无正文命中 —— 这条断言不能空过",
+              unmet: noIndex)
         // 筛选
         // 筛选断言必须**既有命中又全部合规**。
         // 只写 allSatisfy 的话，返回 0 条也能通过 —— 那是空真，等于没测。
@@ -858,7 +1033,8 @@ final class VaultStore: ObservableObject {
                                          limit: 40, filter: kindOnly)
         check("检索：类型筛选既有命中又全部合规",
               !byKind.isEmpty && byKind.allSatisfy { $0.file.kind == sampleKind },
-              "kind=\(sampleKind) → \(byKind.count) 条")
+              "kind=\(sampleKind) → \(byKind.count) 条",
+              unmet: noIndex ?? (byKind.isEmpty ? "kind=\(sampleKind) 筛不出任何命中，合规无从检查" : nil))
 
         let sampleDays = max(1, (searchHits.map(\.file.daysSince).filter { $0 >= 0 }.min() ?? 7))
         var sinceOnly = VaultQuery.SearchFilter(); sinceOnly.sinceDays = sampleDays
@@ -866,22 +1042,29 @@ final class VaultStore: ObservableObject {
                                          limit: 40, filter: sinceOnly)
         check("检索：时间筛选既有命中又全部合规",
               !byTime.isEmpty && byTime.allSatisfy { $0.file.daysSince >= 0 && $0.file.daysSince <= sampleDays },
-              "近 \(sampleDays) 天 → \(byTime.count) 条")
+              "近 \(sampleDays) 天 → \(byTime.count) 条",
+              unmet: noIndex ?? (byTime.isEmpty ? "近 \(sampleDays) 天筛不出任何命中，合规无从检查" : nil))
 
         // 目录筛选：用命中里出现最多的那个顶层目录
-        if let f = searchHits.first(where: { $0.file.rel.contains("/") }),
-           let top = f.file.rel.split(separator: "/").first.map(String.init) {
-            var dirOnly = VaultQuery.SearchFilter(); dirOnly.topDir = top
+        let dirSample = searchHits.first { $0.file.rel.contains("/") }
+        let topDir = dirSample.flatMap { $0.file.rel.split(separator: "/").first.map(String.init) }
+        var byDirOK = false
+        var byDirCount = 0
+        if let topDir {
+            var dirOnly = VaultQuery.SearchFilter(); dirOnly.topDir = topDir
             let byDir = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武",
                                             limit: 40, filter: dirOnly)
-            check("检索：目录筛选既有命中又全部合规",
-                  !byDir.isEmpty && byDir.allSatisfy { $0.file.rel.hasPrefix(top + "/") },
-                  "目录 \(top) → \(byDir.count) 条")
+            byDirCount = byDir.count
+            byDirOK = !byDir.isEmpty && byDir.allSatisfy { $0.file.rel.hasPrefix(topDir + "/") }
         }
+        check("检索：目录筛选既有命中又全部合规", byDirOK,
+              "目录 \(topDir ?? "—") → \(byDirCount) 条",
+              unmet: noHits ?? (topDir == nil ? "命中里没有带目录的文件可取样" : nil))
         // 统计用 COUNT
-        check("统计：有正文文件数用 COUNT", store.textFileCount > 0, "\(store.textFileCount) 个")
+        check("统计：有正文文件数用 COUNT", store.textFileCount > 0, "\(store.textFileCount) 个",
+              unmet: noIndex)
         check("统计：无正文文件数", store.totalFiles - store.textFileCount > 0,
-              "\(store.totalFiles - store.textFileCount) 个")
+              "\(store.totalFiles - store.textFileCount) 个", unmet: noIndex)
 
         // J4：「无正文」有两个口径，不是一个数，说哪个就必须说清是哪个。
         //   body 为空 = `gone=0 AND length(body)=0` —— 2026-10-01 实测 2,202 个
@@ -896,7 +1079,8 @@ final class VaultStore: ObservableObject {
             sql: "SELECT count(*) FROM files WHERE gone=0 AND is_text=0"))
         check("口径：无正文有两个数（body 为空 / is_text=0），必须说清用哪个",
               bodyEmpty >= notText && notText > 0,
-              "body 为空 \(bodyEmpty) 个 · is_text=0 \(notText) 个 · 差额 \(bodyEmpty - notText) 个是文字类但超限未抽取")
+              "body 为空 \(bodyEmpty) 个 · is_text=0 \(notText) 个 · 差额 \(bodyEmpty - notText) 个是文字类但超限未抽取",
+              unmet: noIndex)
 
         // mtime 单位：索引里是毫秒。错当秒会让满屏都是"0 天前"。
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -952,12 +1136,31 @@ final class VaultStore: ObservableObject {
 
         try? FileManager.default.removeItem(at: tmp)
 
-        // 只读证明：对 vault.db 执行写操作必须失败
+        // 只读证明：对 vault.db 执行写操作必须失败。
+        // 但探针要先有句柄才谈得上「证明只读」：索引没打开时它返回 false，
+        // 那不是「写成功了」，而是**没有可执行的对象** —— 记跳过，不记失败。
         let blocked = store.attemptWriteProbe()
-        check("对索引的写操作被拒绝（只读）", blocked, blocked ? "" : "竟然写成功了——只读纪律没生效！")
+        check("对索引的写操作被拒绝（只读）", blocked, blocked ? "" : "竟然写成功了——只读纪律没生效！",
+              unmet: store.loadError != nil ? "索引没打开，写探针没有可执行的对象" : nil)
 
-        print(fail == 0 ? "\n自检通过。" : "\n失败 \(fail) 项。")
-        return fail == 0 ? 0 : 1
+        // 汇总必须三分量，且**跳过不许被读成通过**。
+        print("")
+        print("通过 \(pass) · 跳过 \(skip) · 失败 \(fail)"
+              + (skip > 0 ? " —— 有 \(skip) 项未检查，不构成本次通过" : ""))
+        // 退出码三态，任何两个都不许混：
+        //   0 = 全通过（一个跳过都没有）
+        //   1 = 有失败（沿用原来的码，CI 与脚本一直这么认）
+        //   3 = 没失败但有未检查 —— 非 0，所以任何把「非 0 当失败」的脚本也不会漏掉
+        if fail > 0 {
+            print("自检未通过：\(fail) 项失败。")
+            return 1
+        }
+        if skip > 0 {
+            print("自检未完成：\(skip) 项没检查 —— 这不等于通过。")
+            return 3
+        }
+        print("自检通过。")
+        return 0
     }
 
     /// 顶层目录（用于浏览树）

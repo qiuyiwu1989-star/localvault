@@ -58,6 +58,30 @@ if [ -f "首次运行.md" ]; then
   cp "首次运行.md" "$STAGE/首次运行.md"
 fi
 
+# ── CLI 源码：想接 agent / MCP 的人不用再 clone 仓库 ───────────────────
+#
+# 放 CLI/ 子目录。**不带** test/（那是开发期的烟测）、node_modules（本地没装）、
+# .build（不存在，但顺手挡住以后误加）。
+# 契约：CLI/ 里必须有 cli.js —— 少一个文件就等于给了一条跑不通的路径。
+CLI_SRC="../mcp-server"
+if [ ! -d "$CLI_SRC" ]; then
+  echo "找不到 $CLI_SRC —— 这个 dmg 里就不会有 CLI 源码"
+  echo "（如果你确实只要 App，那没关系；否则请从完整仓库里打包）"
+else
+  echo "==> 带上 CLI 源码 → CLI/（不含 test/、node_modules）"
+  ditto "$CLI_SRC" "$STAGE/CLI"
+  rm -rf "$STAGE/CLI/test" "$STAGE/CLI/node_modules" "$STAGE/CLI/.build"
+  if [ ! -f "$STAGE/CLI/cli.js" ]; then
+    echo "!! CLI/ 里没有 cli.js —— 打包错了，停止"
+    exit 1
+  fi
+  if [ -d "$STAGE/CLI/test" ]; then
+    echo "!! CLI/ 里混进了 test/ —— 停止"
+    exit 1
+  fi
+  echo "    CLI/ 体积：$(du -sh "$STAGE/CLI" | awk '{print $1}')"
+fi
+
 # ── 生成 ────────────────────────────────────────────────────────────
 echo "==> hdiutil create → $DMG"
 hdiutil create -volname "$VOL_NAME" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
@@ -75,6 +99,14 @@ if [ "$MOUNT_CHECK" = "1" ]; then
     echo "    ✓ 挂载卷里的 App 签名自洽（codesign --verify 通过）"
   else
     echo "    !! 挂载卷里的 App 签名校验失败 —— 这个 dmg 不能用"
+    hdiutil detach "/Volumes/$VOL_NAME" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  # CLI/ 也得真在卷上、且入口文件在
+  if [ -f "/Volumes/$VOL_NAME/CLI/cli.js" ]; then
+    echo "    ✓ CLI/ 在卷上（cli.js 在）"
+  else
+    echo "    !! 卷上没有 CLI/cli.js"
     hdiutil detach "/Volumes/$VOL_NAME" >/dev/null 2>&1 || true
     exit 1
   fi

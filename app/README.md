@@ -132,7 +132,8 @@
 cd 工具/本地上下文MCP/app
 sh scripts_build_app.sh          # 编译 + 组装 dist/本地上下文.app
 
-# 无头自检（96 项）—— 不进界面，直接验证能不能读到索引、不变量是否成立
+# 无头自检 —— 不进界面，直接验证能不能读到索引、不变量是否成立
+# 输出是三分量：通过 / 跳过 / 失败，退出码是 0 / 3 / 1
 dist/本地上下文.app/Contents/MacOS/LocalVault --selftest
 
 # 设置签字人（signed_by 不可为空，所以必须有办法设）
@@ -202,9 +203,11 @@ dmg 布局就是 macOS 的老规矩：`本地上下文.app` + 一个指向 `/App
 **所以：「双击即可」是假话。** 这个 dmg 能装到别的 Mac，但：
 
 1. 首次打开**必须手动放行**（Gatekeeper 会拦）；
-2. 目标机器**必须先有索引** —— App 读的是 `~/.localvault/vault.db`，那个库由 CLI 建；
-3. 目标机器**不一定有 Node**，而 CLI 现在**还没发布到 npm**（`npx localvault` 实测 404）——
-   今天能走通的是「把 `mcp-server/` 目录拷过去用 `node` 跑」。
+2. ~~目标机器必须先有索引~~ —— **这条已经不再成立**：App 自己会用原生索引器建索引，
+   首次运行向导让你选目录，不依赖 Node 也不依赖 CLI。（以前确实是「先跑 CLI 建库再开 App」，
+   那是一个 Mac 应用要求用户先装另一个语言的运行时，已废弃。）
+3. 只有**想接给 agent 用（MCP）**时才需要 Node —— 那种用户手上一定已经有（`node --version` 自查）。
+   CLI 源码随 dmg 的 `CLI/` 一起发，不用再 clone 仓库。
 
 完整的首次运行步骤、两条放行办法、以及**这份说明没验证的部分**，见 **[首次运行.md](首次运行.md)**。以那份为准，这里不重复。
 
@@ -271,7 +274,7 @@ P046 的结论就是这个：**"应先接回已有记忆，再考虑扩展服务
   ```bash
   cd app
   sh scripts_build_app.sh                                        # 构建 + 打包，零 error
-  ./dist/本地上下文.app/Contents/MacOS/LocalVault --selftest      # 88 项全绿
+  ./dist/本地上下文.app/Contents/MacOS/LocalVault --selftest      # 通过 127 · 跳过 0 · 失败 0，exit 0
   ./dist/本地上下文.app/Contents/MacOS/LocalVault --tab 提炼 --appearance light &   # 浅色态
   ```
 

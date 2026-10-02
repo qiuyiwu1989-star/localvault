@@ -83,10 +83,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct ContentView: View {
-    @StateObject private var vault = VaultStore()
-    @StateObject private var claims = ClaimStore()
+    /// 两个库句柄装在一个可整体替换的盒子里。
+    ///
+    /// 为什么要换：首次运行向导建好索引之后，那个**以失败打开的**只读句柄必须换掉
+    /// ——它当初 `open()` 就失败了（`db` 还是 nil），`loadOverview()` 救不回来
+    /// （它开头就 `guard db != nil`）。用 `@StateObject` 装一个盒子，
+    /// 比给 `@StateObject` 自己重新赋值可靠。
+    @StateObject private var session = AppSession()
 
     @State private var tab: Tab = ContentView.initialTab ?? .extract
+
+    private var vault: VaultStore { session.vault }
+    private var claims: ClaimStore { session.claims }
 
     /// 直接读 `CommandLine`。
     /// 之前走 delegate 里的全局变量，结果 @State 初值比 delegate 先求值 —— 参数不生效。
@@ -119,6 +127,17 @@ struct ContentView: View {
     /// 同上：渲染/原文两种呈现都要能被截图验收，不能只验一种。
     static var initialRaw: Bool { CommandLine.arguments.contains("--raw") }
 
+    /// `--onboard auto|enter` —— 让**首次运行向导**本身能被验收。
+    /// 理由和上面三个开关完全一样：不能靠手点截图来回归。
+    ///
+    /// 注意：**不动 AppDelegate 里那几个开关的解析**，这个开关只在这里读，
+    /// 和 `--tab` / `--query` / `--pick` / `--raw` 是一个模式。
+    static var onboardingAutomation: OnboardingAutomation? {
+        let args = CommandLine.arguments
+        guard let i = args.firstIndex(of: "--onboard"), i + 1 < args.count else { return nil }
+        return OnboardingAutomation(rawValue: args[i + 1])
+    }
+
     /// 三个板块，对应你描述的三件事。
     /// `rawValue` 是中文且**不许改** —— `--tab` 按它匹配。
     enum Tab: String, CaseIterable, Identifiable {
@@ -149,11 +168,24 @@ struct ContentView: View {
     var body: some View {
         Group {
             if let err = vault.loadError {
-                MissingVaultView(message: err)
+                if needsOnboarding {
+                    // 库里**还没有**东西 → 首次运行向导（主路径）
+                    OnboardingView(automation: ContentView.onboardingAutomation) { session.reopen() }
+                } else {
+                    // 库在但打不开 → 真错误态，别拿向导糊上去
+                    MissingVaultView(message: err)
+                }
             } else {
                 shell
             }
         }
+    }
+
+    /// 索引库**文件都不存在** → 首次运行。
+    /// 库在、只是打不开（损坏 / 权限 / 被锁）→ 那不是「首次运行」，
+    /// 弹向导等于劝人重建，可能把已有数据盖掉。
+    private var needsOnboarding: Bool {
+        !FileManager.default.fileExists(atPath: VaultConfig.defaultDBPath)
     }
 
     // MARK: 窗口结构
@@ -192,6 +224,30 @@ struct ContentView: View {
         case .drive:   DriveView(vault: vault)
         case .search:  SearchView(vault: vault, claims: claims, initialQuery: ContentView.initialQuery)
         }
+    }
+}
+
+// MARK: - 会话（两个库句柄）
+
+/// 索引句柄 + 判断条陈的句柄。向导建完索引后**整体换新**。
+final class AppSession: ObservableObject {
+    @Published var vault: VaultStore
+    @Published var claims: ClaimStore
+
+    init() {
+        vault = VaultStore()
+        claims = ClaimStore()
+    }
+
+    /// 索引刚建好：重新打开。
+    ///
+    /// `vault` 必须**新建**：句柄当初 `open()` 就失败了，`db` 是 nil，
+    /// 而 `loadOverview()` 开头就是 `guard db != nil` —— 调它等于什么都没做。
+    /// `claims` 也重建：在全新的机器上，`~/.localvault/` 可能在向导跑完之前
+    /// 还不存在，它那时候的开库动作是失败的。
+    func reopen() {
+        claims = ClaimStore()
+        vault = VaultStore()
     }
 }
 
@@ -284,9 +340,12 @@ struct SidebarStatus: View {
     }
 }
 
-// MARK: - 索引缺失
+// MARK: - 索引存在但打不开（真错误态）
 //
-// 索引还没建的时候，说清楚该做什么 —— 而不是给一个空白窗口。
+// 注意：**索引库不存在**时不再走这里 —— 那是「首次运行」，走 `OnboardingView` 向导。
+// 这里只处理「库在，但打不开」：文件损坏、权限不对、被别的进程锁着。
+// 这种时候**不该**劝用户「重建一次索引」（那可能把已有数据盖掉），
+// 所以只给真实错误 + 命令行那条路，用来排查或自己决定怎么办。
 // 结构按契约：图标（淡）→ 标题 → 一句说明 → 动作。
 
 struct MissingVaultView: View {
@@ -302,81 +361,38 @@ struct MissingVaultView: View {
         FileManager.default.fileExists(atPath: indexDir)
     }
 
-    // MARK: 界面上给的命令，必须是**这台机器上真能跑**的
-    //
-    // 以前这里固定显示「先用包管理器全局装那个包，再 init + index」。
-    // 但 `localvault` 并没有发布到 npm（实测 registry.npmjs.org/localvault = 404），
-    // 那条命令对谁都不成立：装了 npm 的人拿到 404，没装的人拿到 command not found，
-    // 于是这个空状态给出的唯一下一步是坏的。
-    //
-    // 现在按这台机器的实际情况给三种答案之一；**给不出来就不编**。
-
-    /// `localvault` 在不在 PATH 上
-    private var hasLocalvault: Bool { MissingVaultView.which("localvault") != nil }
-    /// 跑 CLI 源码要用到 node
-    private var nodeOnPath: String? { MissingVaultView.which("node") }
-    /// 从 .app 往上找仓库里的 CLI 源码
-    private var cliScript: String? { MissingVaultView.findCLIScript() }
-
-    private var plan: IndexCommandPlan {
-        if hasLocalvault { return .installed }
-        if let cli = cliScript {
-            return .fromSource(script: cli, nodeMissing: nodeOnPath == nil)
-        }
-        return .unavailable
-    }
-
-    private static func which(_ tool: String) -> String? {
-        let env = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        for dir in env.split(separator: ":") where !dir.isEmpty {
-            let p = String(dir) + "/" + tool
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
-        }
-        return nil
-    }
-
-    /// 从 `.app` 往上找 `mcp-server/cli.js`：
-    /// 在仓库里（`app/dist/本地上下文.app`）三步就能找到；挂在 dmg 里或拷到别处
-    /// 找不到 —— 那时返回 nil，界面改用文字指路，而不是显示一条跑不通的命令。
-    private static func findCLIScript() -> String? {
-        var dir = URL(fileURLWithPath: Bundle.main.bundlePath).deletingLastPathComponent()
-        for _ in 0..<5 {
-            let candidate = dir.appendingPathComponent("mcp-server/cli.js").path
-            if FileManager.default.fileExists(atPath: candidate) { return candidate }
-            let parent = dir.deletingLastPathComponent()
-            if parent.path == dir.path { break }
-            dir = parent
-        }
-        return nil
-    }
+    /// 命令行那条路的实况（探测在 `OnboardingView.swift` 的 `CLIProbe`）
+    private var plan: IndexCommandPlan { CLIProbe.plan }
 
     var body: some View {
-        EmptyState(icon: "externaldrive.badge.questionmark",
-                   title: "还没有可读的索引",
+        EmptyState(icon: "exclamationmark.triangle",
+                   title: "索引打不开",
                    message: message) {
             VStack(alignment: .leading, spacing: Space.sm) {
+                Text("库文件在，但没打开。**这不是**「还没建索引」—— 那种情况会直接给你首次运行向导。")
+                    .faintText()
+                    .fixedSize(horizontal: false, vertical: true)
+
                 if let command = plan.command {
-                    Text("下一步：在终端里建一次索引")
+                    Text("想自己排查或重建的话，命令行这条路在这台机器上是：")
                         .captionText()
                     if let pre = plan.prerequisite {
                         Text(.init(pre))
                             .faintText()
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    commandBlock(command)
+                    CLICommandRow(command: command)
                     Text(.init(plan.note))
                         .faintText()
                         .fixedSize(horizontal: false, vertical: true)
+                    Text("提醒：这条命令会碰到**现有的库**。不想让它改，先把 `~/.localvault/vault.db` 复制一份出来。")
+                        .faintText()
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("下一步：先把 CLI 准备好，再建一次索引")
-                        .captionText()
                     Text(.init(plan.note))
                         .faintText()
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Text("建完后重启这个应用即可读到。")
-                    .faintText()
 
                 HStack(spacing: Space.sm) {
                     if indexDirExists {
@@ -391,74 +407,6 @@ struct MissingVaultView: View {
                 }
             }
             .frame(maxWidth: Shell.readingWidth, alignment: .leading)
-        }
-    }
-
-    /// 命令块。**显示的就是复制到的** —— 所以长路径换行显示，不做截断
-    /// （截断的话屏幕上看到的和粘出来的就不是同一条命令）。
-    private func commandBlock(_ command: String) -> some View {
-        HStack(alignment: .top, spacing: Space.xs) {
-            Text(command)
-                .pathText()
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, Space.xs)
-                .padding(.vertical, Space.xxs)
-                .cardSurface(radius: Radius.sm)
-            Button {
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(command, forType: .string)
-            } label: {
-                Label("复制", systemImage: "doc.on.doc")
-            }
-            .help("复制这条命令")
-        }
-    }
-}
-
-/// 这台机器上「怎么建索引」的三种实情。
-/// 把它分成三种，比写死一条命令诚实：写死的那条，对一半人是空话。
-private enum IndexCommandPlan {
-    /// PATH 上有 `localvault`
-    case installed
-    /// 没有 `localvault`，但找得到 CLI 源码；`nodeMissing` 表示这台机器还没有 node
-    case fromSource(script: String, nodeMissing: Bool)
-    /// 都没有 —— **不给命令**，指路到《首次运行.md》
-    case unavailable
-
-    var command: String? {
-        switch self {
-        case .installed:
-            return "localvault init && localvault index"
-        case .fromSource(let script, _):
-            return "node \"\(script)\" init && node \"\(script)\" index"
-        case .unavailable:
-            return nil
-        }
-    }
-
-    /// 命令之前必须先补的一步。缺 node 时**先说这一步**，
-    /// 而不是把一条会 command not found 的命令直接摆出来。
-    var prerequisite: String? {
-        switch self {
-        case .fromSource(_, true):
-            return "先补一步：CLI 要求 Node ≥ 22.5，而这台机器的 PATH 上没有 `node`。"
-        default:
-            return nil
-        }
-    }
-
-    /// 说明这条命令是哪来的 —— 用户得能判断它对自己成不成立
-    var note: String {
-        switch self {
-        case .installed:
-            return "已在这台机器的 PATH 上找到 `localvault`（它要求 Node ≥ 22.5）。"
-        case .fromSource(_, false):
-            return "这台机器上没有 `localvault` 命令 —— 它还没发布到 npm，所以没有任何包管理器安装命令可用。这里直接跑仓库里的 CLI 源码。"
-        case .fromSource(_, true):
-            return "这台机器上没有 `localvault` 命令 —— 它还没发布到 npm。装好 Node 之后，这条命令直接跑仓库里的 CLI 源码。"
-        case .unavailable:
-            return "这台机器上既没有 `localvault` 命令，也没找到 CLI 源码，或者缺少 Node（≥ 22.5）。dmg 里那份《首次运行.md》的 **1.2 节**写了怎么把 CLI 拿过来。"
         }
     }
 }
