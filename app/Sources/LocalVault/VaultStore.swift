@@ -663,7 +663,9 @@ final class VaultStore: ObservableObject {
         /// 显式记一次「跳过」——**不**拿一个假谓词占位。
         /// 用在「这里根本没东西可查」的分支上：写成 `check(..., false, unmet: x)` 看着像
         /// 一条会红的断言，但 `unmet` 非 nil 时那个 `false` 永远不会被判定 ——
-        /// 扫描器（`scripts_check_assertions.py`）会把它当死代码抓出来，抓得对。
+        /// 扫描器（`scripts/check-assertions.py`）会把它当死代码抓出来，抓得对。
+        /// 顺带记一笔：那条注释原先写的是 `scripts_check_assertions.py` —— 一个**不存在的文件**。
+        /// 一个不存在的工具在替一段代码提供保证，比没有保证更糟。现在它真的存在了。
         func skipCheck(_ name: String, _ reason: String) {
             skip += 1
             print("  \u{2298} \(name)  — 跳过：\(reason)")

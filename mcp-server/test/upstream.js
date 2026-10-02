@@ -208,7 +208,10 @@ async function main() {
       check(`${label}：拼回去逐码点等于原文`, joined === text,
         `原文 ${cps.length} 码点 / 拼回 ${cp.cpLength(joined)} 码点`);
       check(`${label}：每一段都不超预算`,
-        parts.every((p) => cp.cpLength(p.text) <= 500), `最大 ${Math.max(...parts.map((p) => cp.cpLength(p.text)))}`);
+        // 空数组上 `.every()` 恒真；顺带 `Math.max(...[])` 是 `-Infinity`。
+        // 两个征兆指向同一件事：这段预算没考虑「一段都没有」的情况。
+        parts.length > 0 && parts.every((p) => cp.cpLength(p.text) <= 500),
+        `共 ${parts.length} 段 · 最大 ${parts.length ? Math.max(...parts.map((p) => cp.cpLength(p.text))) : '—'}`);
       // 段必须逐段等于原文的连续切片（不是重排、不是改写）
       let okSlice = true;
       for (const p of parts) if (cp.sliceCp(text, p.startCp, p.endCp) !== p.text) okSlice = false;
@@ -275,11 +278,14 @@ async function main() {
     check('确实产生了提交（后面几条角色的断言才有对象）', sent.length >= 4, `实际 ${sent.length} 个请求`);
     const roles = sent.flatMap((r) => r.args.messages.map((m) => m.role));
     check('发出的消息非空', roles.length > 0, `实际 ${roles.length} 条消息`);
-    check('发出的消息里三种角色都在，且没有别的值', roles.every((r) => ['user', 'assistant', 'external'].includes(r)));
+    // 上一行虽然断言了 roles 非空，但那是**另一条**断言；这一条自己也要能失败。
+    check('发出的消息里三种角色都在，且没有别的值',
+      roles.length > 0 && roles.every((r) => ['user', 'assistant', 'external'].includes(r)));
     const thirdParty = sent.filter((r) => JSON.stringify(r.args.messages).includes('我们建议调整方案'));
     check('第三方那条确实发出去了', thirdParty.length >= 1, `实际 ${thirdParty.length}`);
     check('第三方那条的正文没有被标成 user',
-      thirdParty.length >= 1 && thirdParty.every((r) => r.args.messages.every((m) => m.role === 'external')));
+      thirdParty.length >= 1 && thirdParty.every((r) =>
+        r.args.messages.length > 0 && r.args.messages.every((m) => m.role === 'external')));
 
     // 未声明作者 → 字段整个省略，而不是 "unknown"
     const extPayload = thirdParty.length ? thirdParty[0].args : null;
@@ -442,7 +448,11 @@ async function main() {
     check('403 → 立刻停下（stopped=auth）', r6.stopped === 'auth', JSON.stringify(r6).slice(0, 200));
     check('停下后游标不推进', r6.cursorAdvanced === false);
     const after403 = server403.received.filter((r) => r.name === 'memory_import');
-    check('拒绝后没有换 scope 重试', after403.every((r) => r.args.scope === 'agent:localvault-inbox'));
+    // `after403` 为空时 `.every()` 恒真 —— 而「一次都没发」恰恰是最该看见的情况，
+    // 所以必须先把非空写进去，否则这条测试在「什么都没发生」时反而变绿。
+    check('拒绝后没有换 scope 重试',
+      after403.length > 0 && after403.every((r) => r.args.scope === 'agent:localvault-inbox'),
+      `403 之后的 memory_import 次数 ${after403.length}`);
     b6.ledger.close();
 
     // 清单层面的拒绝
@@ -518,7 +528,9 @@ async function main() {
     const dump = JSON.stringify(p);
     check('dry-run 里没有正文句子', !dump.includes('我认为这个方向可行') && !dump.includes('我们建议调整方案'),
       dump.slice(0, 200));
-    check('dry-run 里有 sourceKey 和 versionHash', p.items.every((i) => i.sourceKey && i.versionHash));
+    check('dry-run 里有 sourceKey 和 versionHash',
+      p.items.length > 0 && p.items.every((i) => i.sourceKey && i.versionHash),
+      `items ${p.items.length}`);
     check('dry-run 有耗时字段之外的数量', typeof p.changed === 'number' && typeof p.removed === 'number');
     check('dry-run 不发任何请求', server.received.length === 0);
 

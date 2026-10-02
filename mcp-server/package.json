@@ -33,7 +33,9 @@
     "test:clean": "node test/clean-machine.js",
     "test:upstream": "node test/upstream.js",
     "test:ignore": "node test/ignore-lists.js",
-    "pack": "npm pack"
+    "pack": "npm pack",
+    "test:assertions": "python3 ../scripts/check-assertions.py",
+    "check": "python3 ../scripts/check-assertions.py && npm test"
   },
   "keywords": [
     "mcp",

@@ -1,0 +1,113 @@
+name: CI
+
+# 这个仓库是「给陌生人装的工具」。没有 CI 的公开仓库，等于让陌生人替你当测试。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 最小权限：CI 只需要读代码。
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # 必须用 macOS：仓库里有一套 Swift 索引器，而且测试依赖 macOS 的
+    # `CFFIXED_USER_HOME`（Foundation 认这个变量，Linux 不认）。
+    # 在 Linux 上跑会「看起来通过」，但那不是这台工具真实运行的环境。
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选 Node
+        uses: actions/setup-node@v4
+        with:
+          # node:sqlite 的 DatabaseSync 需要 ≥22.5；下限写在 package.json 的 engines 里。
+          # 这里跑 24 —— 与打包进 App 的那份运行时同一条线。
+          node-version: '24'
+
+      - name: 报告环境
+        run: |
+          node --version
+          swift --version
+          python3 --version
+
+      # ── 静默的坏断言挡在最前面 ──────────────────────────────────
+      # 一条永远不可能变红的 `✓` 比没有断言更糟：它冒充覆盖率。
+      - name: 恒真断言扫描
+        run: python3 scripts/check-assertions.py
+
+      # ── 四个测试 ───────────────────────────────────────────────
+      # 不覆盖 HOME：这几个测试**自己**建假 HOME（这一点是被 CI 逼出来的 ——
+      # smoke.js 原先偷偷依赖「跑测试的机器上恰好有 ~/Desktop」，在空 HOME 上红过两条）。
+      # 既然每个测试自带环境，就不该也不需要在这里替它们造。
+      - name: 测试
+        working-directory: mcp-server
+        run: npm test
+
+      - name: Swift 编译（Release）
+        working-directory: app
+        run: swift build -c release
+
+      # ── App 自检：唯一一句「这台机器上到底能不能用」的自报口径 ──
+      #
+      # 空 HOME 直接跑自检只有 66 条能被检查，其余全跳过 —— 跳过是诚实的，
+      # 但**绿得没有含量**。所以先造一份「什么场景都有」的语料再跑：
+      # 实测把「通过 66 · 跳过 50」变成「通过 120 · 跳过 1」，
+      # 剩下那一跳是「还没有条陈库」，本来就不该有。
+      #
+      # 顺带把「只读」验到底：不只是「没多出文件」，而是自检前后
+      # `.localvault` 里每个文件的**大小与 mtime 逐个相同** ——
+      # 一个只读自检连时间戳都不该碰。
+      - name: App 只读自检（对着真语料，且不留痕）
+        working-directory: app
+        run: |
+          # 用 SwiftPM 自己的 `--show-bin-path`，**不要**去 `find .build/release`：
+          # `.build/release` 是软链接，而 `find` 默认不跟随起始点的软链接 ——
+          # 会「成功退出但什么都不返回」，然后被误判成「编译没出二进制」。
+          BIN="$(swift build -c release --show-bin-path)/LocalVault"
+          if [ ! -x "$BIN" ]; then echo "::error::找不到自检二进制：$BIN"; exit 1; fi
+          echo "自检二进制：$BIN"
+
+          LV_HOME="$(mktemp -d)/home"
+          node ../scripts/make-ci-fixture.mjs "$LV_HOME"
+          HOME="$LV_HOME" CFFIXED_USER_HOME="$LV_HOME" node ../mcp-server/cli.js init
+          HOME="$LV_HOME" CFFIXED_USER_HOME="$LV_HOME" node ../mcp-server/cli.js index
+
+          DATA="$LV_HOME/.localvault"
+          print_fp() { find "$DATA" -type f -exec stat -f '%N %z %m' {} \; 2>/dev/null | sort; }
+          BEFORE=$(print_fp)
+
+          set +e
+          OUT=$(HOME="$LV_HOME" CFFIXED_USER_HOME="$LV_HOME" "$BIN" --selftest 2>&1)
+          CODE=$?
+          set -e
+          AFTER=$(print_fp)
+
+          echo "$OUT"
+          echo "exit=$CODE"
+          echo "—— 自检前的 .localvault ——"
+          echo "$BEFORE"
+
+          case "$CODE" in
+            0|3) ;;
+            *) echo "::error::自检有失败项（exit=$CODE）"; exit 1 ;;
+          esac
+          echo "$OUT" | grep -q "失败 0" || { echo "::error::自检报告里有失败项"; exit 1; }
+
+          # 对着丰富语料应该几乎没有跳过。若跳过突然变多，说明语料或自检退化了。
+          echo "$OUT" | grep -q "跳过 1 " || {
+            echo "::error::跳过项数不是预期的 1 —— 语料没被吃进去，或者自检少检查了东西"
+            echo "$OUT" | grep "⊘" || true
+            exit 1
+          }
+
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "::error::只读自检动了数据目录（大小或 mtime 变了）"
+            diff <(echo "$BEFORE") <(echo "$AFTER") || true
+            exit 1
+          fi
+          echo "✓ 自检没有改动数据目录里的任何一个文件（含 mtime）"

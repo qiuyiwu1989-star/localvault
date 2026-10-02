@@ -504,10 +504,24 @@ async function main() {
     check('lib/ 与 cli.js 不含个人标识', leaks.length === 0, leaks.slice(0, 6).join('\n'));
 
     // 防回归守卫（默认值行为层）：这是「通用化」真正的验收标准。
+    //
+    // ⚠️ 必须自带一个假 HOME。原先这段只改了 LOCALVAULT_CONFIG，没管 HOME ——
+    // 于是它偷偷依赖「跑测试的这台机器上恰好有 ~/Desktop 与 ~/Downloads」。
+    // 开发机上永远为真，所以一直没被发现；一进 CI（空 HOME）就红两条。
+    // 这类测试的毛病不在断言写得不对，而在**它验证的是运行环境，不是被测代码**。
+    const fakeHome = path.join(tmp, 'home');
+    fs.mkdirSync(path.join(fakeHome, 'Desktop'), { recursive: true });
+    fs.mkdirSync(path.join(fakeHome, 'Downloads'), { recursive: true });
+    fs.mkdirSync(path.join(fakeHome, 'Documents'), { recursive: true });
+    const cleanEnv = { ...process.env, HOME: fakeHome, CFFIXED_USER_HOME: fakeHome };
+    delete cleanEnv.XDG_CONFIG_HOME;
+    delete cleanEnv.XDG_DESKTOP_DIR;
+    delete cleanEnv.XDG_DOWNLOAD_DIR;
+
     const defaultProbe = spawnSync(process.execPath, ['-e', `
       const {defaultConfig}=require('${path.join(ROOT, 'lib/config.js')}');
       process.stdout.write(JSON.stringify(defaultConfig()));
-    `], { encoding: 'utf8' });
+    `], { encoding: 'utf8', env: cleanEnv });
     let def = null;
     try { def = JSON.parse(defaultProbe.stdout); } catch (e) { /* 保持 null */ }
     check('defaultConfig() 可求值', def !== null, defaultProbe.stderr.slice(0, 300));
@@ -516,7 +530,17 @@ async function main() {
       check('默认不含个人入口文档与目录用途', def.canonicalDocs.length === 0 && Object.keys(def.dirNotes).length === 0);
       check('默认不含个人收集目录与卡片目录', def.policy.inboxDir === null && def.policy.projectCardDir === null);
       check('默认根不写死任何具体路径（只探测系统目录）',
-        def.roots.every((r) => !String(r.path).includes('邱懿武')), JSON.stringify(def.roots));
+        // 非空前提是必需的：空数组上 `.every()` 恒真，一个「默认根变成空数组」的
+        // 回归会在这里伪装成通过。有了自带的假 HOME，这个前提**必然成立**，
+        // 所以它不再是「把空集当通过」，而是真的钉住了非空。
+        def.roots.length > 0 && def.roots.every((r) => !String(r.path).includes('邱懿武')),
+        JSON.stringify(def.roots));
+      check('默认根恰好是 桌面 + 下载，不牵连 文档',
+        def.roots.length === 2
+        && def.roots.some((r) => r.path === path.join(fakeHome, 'Desktop'))
+        && def.roots.some((r) => r.path === path.join(fakeHome, 'Downloads'))
+        && !def.roots.some((r) => r.path === path.join(fakeHome, 'Documents')),
+        JSON.stringify(def.roots.map((r) => path.relative(fakeHome, r.path))));
       check('治理词表可配置且非空', Array.isArray(def.policy.versionNamePatterns) && def.policy.versionNamePatterns.length > 0);
     }
 
@@ -527,7 +551,7 @@ async function main() {
       const out={roots:c.roots.map(r=>r.path),version:c.version,canonicalDocs:c.canonicalDocs.length,ledgerFile:c.ledgerFile,rulesFile:c.rulesFile,inboxDir:c.policy.inboxDir};
       process.stdout.write(JSON.stringify(out));
     `], {
-      env: { ...process.env, LOCALVAULT_CONFIG: path.join(tmp, 'nonexistent-config.json') },
+      env: { ...cleanEnv, LOCALVAULT_CONFIG: path.join(tmp, 'nonexistent-config.json') },
       encoding: 'utf8',
     });
     let probe = null;
