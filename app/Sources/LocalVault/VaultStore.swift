@@ -510,6 +510,73 @@ final class VaultStore: ObservableObject {
         VaultQuery.topLevelDirs(dbPath: dbPath)
     }
 
+    /// 上一次索引**正常收尾**的时间（`meta.last_scan_at`，毫秒 → Date）。nil = 没有这一行。
+    ///
+    /// 为什么它是「这次真的扫完了」的同义词：`last_scan_at` 写在索引的**最后一步**
+    /// （见 `VaultIndexer.swift`：写在最后），取消 / 中途退出的那次不会留下它。
+    /// 所以「在」= 完整收尾，「不在」= 半成品。
+    var lastScanAt: Date? {
+        guard let raw = metaString("last_scan_at"), let ms = Double(raw) else { return nil }
+        return Date(timeIntervalSince1970: ms / 1000)
+    }
+
+    /// 这个索引是不是**一次完整收尾的扫描**留下的。
+    ///
+    /// 判据只有一条：`meta.last_scan_at` 在不在。
+    /// 一个被取消的索引**完全可读**（integrity_check = ok、行数也对），所以它跟
+    /// `loadError` 是**两件事**：库没坏，只是可能少了一大半文件。界面必须能正常用，
+    /// 但要**标明不完整**并给补齐入口 —— 否则用户取消一次之后，会永远看到一个
+    /// 少了 90% 文件的「完整」索引，而且没有任何线索（这正是「坏掉看起来像正常」）。
+    var indexIsComplete: Bool { metaString("last_scan_at") != nil }
+
+    /// 从 `meta` 读一行文本。读不到（没有这个 key / 库没打开）返回 nil。
+    private func metaString(_ key: String) -> String? {
+        guard let db else { return nil }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = ?", -1, &stmt, nil) == SQLITE_OK,
+              let s = stmt else { return nil }
+        defer { sqlite3_finalize(s) }
+        sqlite3_bind_text(s, 1, key, -1, SQLITE_TRANSIENT)
+        guard sqlite3_step(s) == SQLITE_ROW, let c = sqlite3_column_text(s, 0) else { return nil }
+        return String(cString: c)
+    }
+
+    /// 索引根下面**真的有**机器生成的目录吗（node_modules / .git / build 之类）。
+    ///
+    /// 「跳过了机器生成目录」这条断言的前提就是这个。为什么要走文件系统：
+    /// 索引里**没有**它们正是「跳过生效」的结果，拿索引当前提是循环论证。
+    /// 只走有限层次、有预算上限，找到就走 —— 自检里几百毫秒可以接受。
+    func rootsContainMachineDir(depth: Int = 3, budget: Int = 20_000) -> Bool {
+        // 这份名单必须是 `VaultIndexer.defaultIgnoredDirs` 的**子集**：前提说「有这个目录」，
+        // 就得真担保「索引器会跳过它」，否则会出现「前提成立、但索引器没跳」的假红。
+        // 所以这里**故意不包括** `.build` / `.venv` / `bin` / `obj` —— 它们不在索引器名单里。
+        let names: Set<String> = ["node_modules", ".git", ".svn", ".hg", ".bzr",
+                                  "__pycache__", ".mypy_cache", ".pytest_cache", ".tox",
+                                  "dist", "build", ".next", ".nuxt", ".svelte-kit",
+                                  "coverage", "target", ".gradle", ".m2", ".cargo", ".rustup",
+                                  ".idea", ".vs", "Pods", "Carthage", "DerivedData", ".swiftpm",
+                                  ".cache", ".npm", ".pnpm-store", ".Trash", "site-packages",
+                                  ".ipynb_checkpoints", "Caches"]
+        var queue: [(String, Int)] = roots.map { ($0.path, 0) }
+        var left = budget
+        while !queue.isEmpty {
+            let (dir, d) = queue.removeFirst()
+            left -= 1
+            if left <= 0 { return false }
+            guard d < depth,
+                  let items = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            for it in items {
+                var isDir: ObjCBool = false
+                let full = (dir as NSString).appendingPathComponent(it)
+                guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir),
+                      isDir.boolValue else { continue }
+                if names.contains(it) { return true }
+                queue.append((full, d + 1))
+            }
+        }
+        return false
+    }
+
     /// 地图里的顶层目录名 —— 用来判断「文件是否在项目目录里」
     var topDirNames: Set<String> {
         guard let m = VaultMap.decode(mapText) else { return [] }
@@ -631,16 +698,28 @@ final class VaultStore: ObservableObject {
               unmet: noIndex)
         check("读到索引根", !store.roots.isEmpty, store.roots.map(\.label).joined(separator: " / "),
               unmet: noIndex)
-        check("读到扫描记录（含跳过目录数）", !store.lastScan.isEmpty, "", unmet: noIndex)
+        // 「读到扫描记录」在**取消留下的库**上应该是什么？没有扫描记录是**事实**，
+        // 不是 bug —— 所以那是跳过，并说清缺的是什么（上次没正常收尾），不是红。
+        let noScanRecord: String? = noIndex
+            ?? (store.indexIsComplete ? nil
+                : "上次扫描没有正常收尾（meta 里没有 last_scan_at）—— 没有扫描记录可读")
+        check("读到扫描记录（含跳过目录数）", !store.lastScan.isEmpty, "", unmet: noScanRecord)
+        // 但「这次没跑完」本身必须有一条**能红**的断言：它是用户会直接踩到的状态
+        // （取消一次之后永远看到一个少了一大半文件的「完整」索引）。红=真信号，不是假红。
+        check("索引完整（meta.last_scan_at 在 = 上次真的扫完了）", store.indexIsComplete,
+              store.lastScanAt.map {
+                  "上次完整收尾 " + DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short)
+              } ?? "上次扫描没有正常收尾 —— 这个库可能是半成品：完全可读，但文件可能少一大截；重跑一次索引即可补齐",
+              unmet: noIndex)
         let skipped = store.lastScan.reduce(Int64(0)) { $0 + $1.skippedDirs }
-        // 「跳过了机器生成的目录」的前提是「语料里本来就该有机器生成的目录」。
-        // 一个只有 9 个文件的桌面里一个都没有 —— 那时报红是假红（正常看起来像坏掉）。
-        // 前提不成立就走第三通道，并把缺的前提说清楚：不是「跳过数为 0」，是「语料太小」。
-        // 判据用与六级梯子同一个口径（语料下限 300），别为了消一条红另造一把尺子。
+        // 「跳过了机器生成的目录」的前提是：索引根下面**真的有**机器生成的目录。
+        // 判据走**文件系统**（索引里没有它们正是「跳过生效」的结果，拿索引判是循环论证），
+        // 不用「文件数量」当代理 —— 3,513 个文件也可能一个这种目录都没有（那是形状，不是大小）。
+        let corpusHasMachineDir = store.rootsContainMachineDir()
         let machineDirPremise: String? = noIndex
-            ?? (store.totalFiles < 300
-                ? "语料太小（\(store.totalFiles) 个文件）—— 这样一堆文件里本来就不该有"
-                    + "机器生成的目录（node_modules / .git / build 之类），跳过口径无从检验" : nil)
+            ?? (corpusHasMachineDir ? nil
+                : "索引根下面没有机器生成的目录（node_modules / .git / build 之类）"
+                    + "—— 「有没有正确跳过」在这台机器上无从检验")
         check("口径：跳过的机器生成目录", skipped > 0, "\(skipped) 个", unmet: machineDirPremise)
         check("读到类型分布", !store.kinds.isEmpty, "\(store.kinds.count) 类", unmet: noIndex)
         // 地图由建索引的那一步生成，**原生索引器不写它**（已知缺口，见 CHANGELOG）。
@@ -831,28 +910,22 @@ final class VaultStore: ObservableObject {
         let triageMs = Int(Date().timeIntervalSince(tTriage) * 1000)
         // 这一节全都要有文件才有意义：没有文件时 `triaged.count == all.count`（0 == 0）
         // 和 `allSatisfy`（空集为真）都会**空真通过** —— 那正是「0 被当成通过」。
-        check("分类：完成", triaged.count == all.count, "\(triaged.count) 条, \(triageMs)ms", unmet: noIndex)
-        // 每一级的文件数：**既是诊断输出，也是真断言**。
-        // 原来写作 `check("分类：\(tb.rawValue)", true, "\(n) 个")` —— 永远不可能红，
-        // 等于用 6 行「✓」冒充了六级梯子的覆盖率。现在写成 `n > 0`：
-        // 哪一级塌成空集，哪一级当场变红（分级退化 = 这个工具最值钱的部分坏了）。
-        //
-        // 「每一级都必须有文件」这个前提只在**语料够丰富**时成立：CLI 刚在一个只有
-        // 9 个文件的桌面上建好库时，某几级为空是正常的 —— 那时报红就是喊狼来了。
-        // 前提不成立就按第三通道跳过（不是通过，也不是失败）。阈值取 300：
-        // 本机真实语料 9841，远在其上；比它小的语料本来也说明不了「六级是否都该出现」。
-        let ladderCorpusFloor = 300
-        let thinCorpus: String? = noIndex
-            ?? (all.count < ladderCorpusFloor
-                ? "语料太小（\(all.count) 个文件）—— 六级是否都出现，要够丰富的一堆文件才说明得了问题"
-                : nil)
+        // `noIndex` 已经挡住「没有索引 / 索引里 0 条」；这里再挡住「索引有行、但一条都没读出来」
+        // （那是查询这一路坏了，由上一条「分类：读到文件」判红），不让 `0 == 0` 冒充通过。
+        check("分类：完成", triaged.count == all.count, "\(triaged.count) 条, \(triageMs)ms",
+              unmet: noIndex
+                  ?? (all.isEmpty ? "一条文件都没读出来（见上一条红的断言）—— 0 == 0 不算通过" : nil))
+        // 每一级的文件数是**信息**，不是断言：某一级为空不是 bug。
+        // （一个只有 .md 的语料本来就该「务必读=0 / 只检索=0」；3,513 个文件也可能
+        //   一个源码、一个构建产物都没有 —— 这是**形状**，不是大小，更不是故障。
+        //   之前写成 `n > 0`，于是拿「作者那台工作区的形状」当判据，在别人的机器上喊狼来了。）
+        // 六级梯子真正该守的是**不变量**，见下面那条「六级之和 = 被判断的文件总数」。
         let levelCounts: [(Triage, Int)] = Triage.allCases.map { tb in
             (tb, triaged.filter { $0.triage == tb }.count)
         }
-        for (tb, n) in levelCounts {
-            check("分类：\(tb.rawValue)（这一级在真实索引里必须有文件）", n > 0,
-                  "\(n) 个", unmet: thinCorpus)
-        }
+        note("分类构成："
+             + levelCounts.map { "\($0.0.rawValue) \($0.1)" }.joined(separator: " / ")
+             + "（某一级为 0 是语料形状，不是缺陷）")
         // 六级之和 = 被判断的文件总数。它守的不是 triage 本身（那由「分类：完成」守），
         // 而是**上面这个直方图的算法**：谓词写错（多一个 / 少一个条件）时，
         // 和会立刻不等于总数。
@@ -944,8 +1017,14 @@ final class VaultStore: ObservableObject {
             // 它守的是这一段的谓词 —— 有人给这个 `where` 多加一个条件，和就会小于 n，红。
             // 诊断内容（top 4 构成）作为 detail 保留：「打印」和「断言」各归各位，
             // 不再由一个 `check` 兼职。
+            // ⚠️ 这一条在**该级为空**时是 `0 == 0`：一个恒真的等式。
+            // 它曾经是 task-22 从 `check(..., true, ...)` 改出来的「真断言」，但在空集合上
+            // 退化成了同一个东西 —— 说明「真断言」不是一次性性质，它**依赖前提成立**。
+            // 所以前提写进 unmet：这一级有文件才判，没有就跳过（跳过不是通过）。
             check("分类构成：\(tb.rawValue)（各类型之和 = 该级文件数）", histSum == n,
-                  "\(top) · 和 \(histSum)/\(n)", unmet: noIndex)
+                  "\(top) · 和 \(histSum)/\(n)",
+                  unmet: noIndex
+                      ?? (n == 0 ? "这一级一个文件都没有（0/0 是空的，不是不变量的证据）" : nil))
         }
         // 噪音理由直方图 —— 定位是哪条规则吃掉了太多文件
         var reasons: [String: Int] = [:]
@@ -960,11 +1039,6 @@ final class VaultStore: ObservableObject {
         if noIndex == nil {
             note("没用的主要理由：\(topReasons.isEmpty ? "（不看级没有任何 ✗ 理由）" : topReasons)")
         }
-
-        check("分类：每一级在真实数据里都有文件",
-              Triage.allCases.allSatisfy { tb in triaged.contains { $0.triage == tb } },
-              Triage.allCases.map { tb in "\(tb.rawValue)=\(triaged.filter { $0.triage == tb }.count)" }.joined(separator: " "),
-              unmet: thinCorpus)
 
         // ── 六级梯子：顺序 + 每级各由什么证据定 ─────────────────────
         check("梯子：rank 从 0 连续到 5，没有跳号",
@@ -1178,7 +1252,7 @@ final class VaultStore: ObservableObject {
         // 只写 allSatisfy 的话，返回 0 条也能通过 —— 那是空真，等于没测。
         let sampleKind = searchHits.first?.file.kind ?? "doc"
         var kindOnly = VaultQuery.SearchFilter(); kindOnly.kinds = [sampleKind]
-        let byKind = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武",
+        let byKind = VaultQuery.searchEx(dbPath: store.dbPath, keyword: searchKeyword ?? "",
                                          limit: 40, filter: kindOnly)
         check("检索：类型筛选既有命中又全部合规",
               !byKind.isEmpty && byKind.allSatisfy { $0.file.kind == sampleKind },
@@ -1187,28 +1261,41 @@ final class VaultStore: ObservableObject {
 
         let sampleDays = max(1, (searchHits.map(\.file.daysSince).filter { $0 >= 0 }.min() ?? 7))
         var sinceOnly = VaultQuery.SearchFilter(); sinceOnly.sinceDays = sampleDays
-        let byTime = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武",
+        let byTime = VaultQuery.searchEx(dbPath: store.dbPath, keyword: searchKeyword ?? "",
                                          limit: 40, filter: sinceOnly)
         check("检索：时间筛选既有命中又全部合规",
               !byTime.isEmpty && byTime.allSatisfy { $0.file.daysSince >= 0 && $0.file.daysSince <= sampleDays },
               "近 \(sampleDays) 天 → \(byTime.count) 条",
               unmet: noIndex ?? (byTime.isEmpty ? "近 \(sampleDays) 天筛不出任何命中，合规无从检查" : nil))
 
-        // 目录筛选：用命中里出现最多的那个顶层目录
-        let dirSample = searchHits.first { $0.file.rel.contains("/") }
-        let topDir = dirSample.flatMap { $0.file.rel.split(separator: "/").first.map(String.init) }
+        // 目录筛选：从命中里**逐个试**那些带目录的文件，取第一个「筛完还有命中」的目录。
+        // 原来只拿命中里的第一个目录（还配一个硬编码关键词），那个目录筛出 0 条就红 ——
+        // 而「第一个命中的目录恰好没有其他命中」是语料形状，不是故障。
+        var seenDirs = Set<String>()
+        let dirCandidates = searchHits.compactMap { h -> String? in
+            let rel = h.file.rel
+            guard rel.contains("/"), let first = rel.split(separator: "/").first else { return nil }
+            let d = String(first)
+            return seenDirs.insert(d).inserted ? d : nil
+        }
+        var topDir: String? = nil
         var byDirOK = false
         var byDirCount = 0
-        if let topDir {
-            var dirOnly = VaultQuery.SearchFilter(); dirOnly.topDir = topDir
-            let byDir = VaultQuery.searchEx(dbPath: store.dbPath, keyword: "邱懿武",
+        for cand in dirCandidates {
+            var dirOnly = VaultQuery.SearchFilter(); dirOnly.topDir = cand
+            let byDir = VaultQuery.searchEx(dbPath: store.dbPath, keyword: searchKeyword ?? "",
                                             limit: 40, filter: dirOnly)
-            byDirCount = byDir.count
-            byDirOK = !byDir.isEmpty && byDir.allSatisfy { $0.file.rel.hasPrefix(topDir + "/") }
+            if !byDir.isEmpty {
+                topDir = cand
+                byDirCount = byDir.count
+                byDirOK = byDir.allSatisfy { $0.file.rel.hasPrefix(cand + "/") }
+                break
+            }
         }
         check("检索：目录筛选既有命中又全部合规", byDirOK,
-              "目录 \(topDir ?? "—") → \(byDirCount) 条",
-              unmet: noHits ?? (topDir == nil ? "命中里没有带目录的文件可取样" : nil))
+              topDir.map { "目录 \($0) → \(byDirCount) 条" } ?? "没有能筛出命中的目录可取样",
+              unmet: noHits ?? (topDir == nil
+                  ? "命中里没有一个目录在筛选后还能筛出命中 —— 取样取不到" : nil))
         // 统计用 COUNT
         // 「无正文」这两条的前提是「语料里真有不是文字的文件」。
         // 判据用**扩展名**，不用 `is_text`/`body` —— 那两个正是被检查的列，
