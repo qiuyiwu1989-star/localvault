@@ -504,13 +504,54 @@ class LocalVaultServer {
     return { text: cov.markdown };
   }
 
+  /**
+   * 参数写错时的提示。**这些原本全是静默降级。**
+   *
+   * 实测过的四种：`root:"不存在的根"` 被忽略、`since:"昨天"` 被忽略（悄悄按 7 天算）、
+   * `sort:"bogus"` 被忽略、`format:"xml"` 被忽略。调用方**无法知道自己给错了** ——
+   * 它拿到一个看起来正常的答案，然后基于错误的假设继续。
+   *
+   * 对 agent 尤其致命：agent 试一次参数、拿到结果、就认为参数是对的。
+   * 静默降级把「试错」变成了「撞上一个碰巧的答案」。
+   */
+  paramWarnings(a) {
+    // 本文件用方法内惰性 require，所以这里也得自己取。
+    const { resolveRoot } = require('./vault');
+    const { parseSince } = require('./util');
+    const w = [];
+    if (a.root != null && a.root !== '' && !resolveRoot(this.cfg, a.root)) {
+      const labels = this.cfg.roots.map((r) => `\`${r.label}\``).join('、');
+      w.push(`「root: ${JSON.stringify(a.root)}」不对应任何索引根，**这个条件已被忽略**。可用：${labels}`);
+    }
+    for (const key of ['since', 'before']) {
+      const v = a[key];
+      if (v != null && v !== '' && parseSince(v) == null) {
+        w.push(`「${key}: ${JSON.stringify(v)}」看不懂，**已按默认值处理**。可用 \`7d\` / \`24h\` / \`3周\` / \`2个月\` 或毫秒时间戳。`);
+      }
+    }
+    if (a.sort != null && !['relevance', 'recent', 'oldest', 'size', 'name'].includes(String(a.sort))) {
+      w.push(`「sort: ${JSON.stringify(a.sort)}」不是可用的排序，**已按默认排序**。可用 relevance / recent / oldest / size / name。`);
+    }
+    if (a.format != null && a.format !== 'json' && a.format !== 'markdown') {
+      w.push(`「format: ${JSON.stringify(a.format)}」不认识，**已按 markdown 处理**。可用 json / markdown。`);
+    }
+    if (a.limit != null) {
+      const n = Number(a.limit);
+      if (!Number.isFinite(n) || n < 1) {
+        w.push(`「limit: ${JSON.stringify(a.limit)}」不是正整数，**已按默认值处理**。`);
+      }
+    }
+    return w;
+  }
+
   toolFindFiles(args) {
     const pending = this.ensureIndexed('find_files');
     if (pending) return { text: pending };
     const db = this.db_();
-    const { searchFiles } = require('./search');
+    const { searchFiles, countDenied } = require('./search');
     const { resolveRoot } = require('./vault');
     const a = args || {};
+    const warns = this.paramWarnings(a);
     const rootPath = a.root ? resolveRoot(this.cfg, a.root) : null;
     const res = searchFiles(db, this.cfg, {
       query: a.query,
@@ -529,10 +570,27 @@ class LocalVaultServer {
     if (!res.ok) return { __error: res.error };
 
     const L = [];
+    if (warns.length) {
+      L.push('> ⚠️ **参数有问题**（已按默认值继续，结果可能不是你要的）：');
+      for (const w of warns) L.push(`> - ${w}`);
+      L.push('');
+    }
     L.push(`检索「${res.query || '(空，按时间列出)'}」：返回 ${res.returned} 条${res.hasMore ? '（还有更多，可提高 limit 或缩小范围）' : ''}，用时 ${res.tookMs}ms。`);
     L.push('');
     if (!res.hits.length) {
       L.push('没有命中。');
+      L.push('');
+      // 「真的没有」和「有但被策略排除」必须能分开。
+      // 实测的坑：`find_files{ext:".env"}` 返回 0 条，而 `list_directory` 明确列出了
+      // `shilu-studio/.env` —— 同一份数据，一个说「有」，一个说「没有命中」。
+      const deniedHit = countDenied(db, { root: rootPath || undefined, nameLike: (a.ext || a.query || '').replace(/^\*/, '') });
+      if (deniedHit > 0) {
+        L.push(`**但有 ${deniedHit} 个文件是按策略排除的**（密钥类，正文从未入库）——`);
+        L.push('它们**不会被检索到**，这是有意的。这不是「索引坏了」，也不是「文件不存在」。');
+        L.push('用 `list_directory` 能看到它们的元数据；正文永远读不到（见 隐私.md）。');
+      } else {
+        L.push('索引里确实没有匹配的文件（也确认过：不是被策略排除造成的）。');
+      }
       L.push('');
       L.push('可以尝试：换个同义词、缩短关键词（中文 2 个字也能搜）、把 scope 设为 `name` 只搜文件名、或用 `since` 限定时间范围。');
       return { text: L.join('\n') };
@@ -640,7 +698,16 @@ class LocalVaultServer {
     const a = args || {};
     const sinceMs = parseSince(a.since || '7d') || Date.now() - 7 * 86400000;
     const rootPath = a.root ? resolveRoot(this.cfg, a.root) : this.cfg.primaryRoot;
-    const rows = listFiles(db, { root: rootPath, pathPrefix: a.path_prefix, sinceMs, limit: a.limit || 40 });
+    // `withTotal` 是关键：没有它，下面那句「命中 N 条」只能是 `LIMIT` 出来的行数。
+    // 实测：limit=40 → 报「命中 40 条」，而真值是 4,805 条。
+    // 那不是「少报了一点」，是把上限写成了总数，而且它**看起来就是个统计值**。
+    const rows = listFiles(db, {
+      root: rootPath,
+      pathPrefix: a.path_prefix,
+      sinceMs,
+      limit: a.limit || 40,
+      withTotal: true,
+    });
 
     const byTop = new Map();
     for (const r of rows) {
@@ -653,12 +720,28 @@ class LocalVaultServer {
     }
 
     const L = [];
+    const total = rows.total != null ? rows.total : rows.length;
+    const warns = this.paramWarnings(a);
     L.push(`# 最近改动（自 ${formatDate(sinceMs)} 起）`);
     L.push('');
-    L.push(`根：\`${rootPath}\`　命中 ${rows.length} 条。`);
+    if (warns.length) {
+      L.push('> ⚠️ **参数有问题**（已按默认值继续，结果可能不是你要的）：');
+      for (const w of warns) L.push(`> - ${w}`);
+      L.push('');
+    }
+    // 说清三个数：一共多少、返回了多少、下面列出的是什么。
+    // 原来只有一个数，还被写成了「命中」。
+    L.push(`根：\`${rootPath}\`　**共 ${total} 条**${total > rows.length ? `，下面列出最近改动的 ${rows.length} 条` : ''}。`);
+    if (total > rows.length) {
+      L.push('');
+      L.push(`> 要提高返回条数用 \`limit\`（当前 ${rows.length}）。`);
+      L.push('> 想按别的根看，用 `root` 指定 —— **不传时只查主根，其它根一条都不出现**。');
+    }
     L.push('');
     if ((a.group_by || 'topdir') !== 'none' && byTop.size) {
-      L.push('## 按顶层目录');
+      // 这张表建在**返回的那 N 条**上，不是全部。原来没有任何说明，
+      // 于是「smart_editing 40 条（100%）」被读成了整体分布。
+      L.push(`## 按顶层目录（仅统计上面那 ${rows.length} 条${total > rows.length ? '，不是全部' : ''}）`);
       L.push('');
       L.push('| 目录 | 条数 | 体量 |');
       L.push('| --- | ---: | ---: |');

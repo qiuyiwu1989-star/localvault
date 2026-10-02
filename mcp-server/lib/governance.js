@@ -110,13 +110,27 @@ function checkDuplicates(db, cfg, opts) {
     .sort((a, b) => b.wastedBytes - a.wastedBytes);
 
   // 同名簇（不同目录里散落的同名文件）
-  const nameRows = db
+  // ── 同名簇：这里原来把「取了多少个」当成了「一共有多少个」 ─────────────
+  //
+  // 原写法是 `LIMIT 200` 一次查询 + 循环到 `limitGroups` 就 `break`，
+  // 然后把 `sameName.length` 当作 `summary.sameNameGroups` 报出去。
+  // 于是 limit=25 报 25、limit=1 报 1、默认报 20 —— 它是 `min(候选数, limit)`，
+  // **是个上限，不是计数**。而它旁边紧挨着的 `exactGroups:350` 是真计数，
+  // 两者并排放在同一个 summary 里，读的人分不出哪个是哪个。
+  // 实测本机真实同名簇 ≥1713，而报告说 20 —— 差两个数量级。
+  //
+  // 修法：GROUP BY 的结果本来就只是一行一个名字，全取回来很便宜（本机约千行），
+  // 取全之后**计数是真的**，「只列前 N 个」才是那个被 limit 影响的东西。
+  const nameRowsAll = db
     .prepare(
       `SELECT name, count(*) AS c, coalesce(sum(size),0) AS s FROM files
        WHERE gone = 0 AND is_symlink = 0 AND size >= 1024 ${rootFilter}
-       GROUP BY lower(name) HAVING c > 1 ORDER BY s DESC LIMIT 200`,
+       GROUP BY lower(name) HAVING c > 1 ORDER BY s DESC`,
     )
     .all(...params);
+  // 常见名（LICENSE、README 之类）不算「散落的同名」，和循环里的跳过保持一致。
+  const nameRows = nameRowsAll.filter((nr) => !UBIQUITOUS_NAMES.has(String(nr.name).toLowerCase()));
+  const sameNameGroupsTotal = nameRows.length;
 
   const sameName = [];
   for (const nr of nameRows) {
@@ -158,7 +172,7 @@ function checkDuplicates(db, cfg, opts) {
   const md = [];
   md.push('# 重复文件体检');
   md.push('');
-  md.push(`可回收空间（完全重复）：**${formatBytes(wasted)}**；完全重复组 ${exact.length} 个，同名簇 ${sameName.length} 个。`);
+  md.push(`可回收空间（完全重复）：**${formatBytes(wasted)}**；完全重复组 ${exact.length} 个，同名簇 ${sameNameGroupsTotal} 个${sameNameGroupsTotal > sameName.length ? `（下面列前 ${sameName.length} 个）` : ''}。`);
   if (truncated) md.push(`\n> 哈希预算已用尽，结果可能不完整（已扫描约 ${formatBytes(hashed)}）。`);
   if (skipped.c > 0) {
     md.push(
@@ -179,7 +193,7 @@ function checkDuplicates(db, cfg, opts) {
     md.push('没有发现内容完全相同的文件。');
     md.push('');
   }
-  if (sameName.length) {
+  if (sameNameGroupsTotal) {
     md.push('## 同名文件散落在多处');
     md.push('');
     for (const g of sameName.slice(0, limitGroups)) {
@@ -188,7 +202,7 @@ function checkDuplicates(db, cfg, opts) {
       md.push('');
     }
   }
-  return { check: 'duplicates', summary: { exactGroups: exact.length, sameNameGroups: sameName.length, reclaimableBytes: wasted, truncated, skippedTooLarge: Number(skipped.c), skippedTooLargeBytes: Number(skipped.s) }, exact, sameName, markdown: md.join('\n') };
+  return { check: 'duplicates', summary: { exactGroups: exact.length, sameNameGroups: sameNameGroupsTotal, sameNameShown: sameName.length, sameNameCapped: sameNameGroupsTotal > sameName.length, reclaimableBytes: wasted, truncated, skippedTooLarge: Number(skipped.c), skippedTooLargeBytes: Number(skipped.s) }, exact, sameName, markdown: md.join('\n') };
 }
 
 /* ------------------------------------------------------------------ *

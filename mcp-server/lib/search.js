@@ -281,8 +281,42 @@ function listFiles(db, opts) {
     params.push(Number(o.maxDepth));
   }
   if (o.filesOnly !== false) where.push('is_symlink = 0');
+  const whereSql = where.join(' AND ');
+
+  // 调用方要「一共有多少」时，用**同一套 WHERE** 再数一次。
+  //
+  // 为什么必须有：`recent_changes` 原来把 `LIMIT` 出来的行数写成「命中 N 条」——
+  // 40 行就报「命中 40 条」，而真实是 4,805 条。一个上限被当成了总数，
+  // 而且它看起来完全是个统计值。**这比不给数字更坏**，因为它会被当成事实引用。
+  //
+  // 挂在数组上（而不是改返回类型）是为了不动现有调用方：
+  // 不传 `withTotal` 的调用方拿到的东西和以前一模一样。
+  if (o.withTotal) {
+    const total = db.prepare(`SELECT count(*) AS c FROM files WHERE ${whereSql}`).get(...params).c;
+    const sql = `SELECT root, path, rel, name, ext, kind, size, mtime, is_text, denied, title
+                 FROM files WHERE ${whereSql}
+                 ORDER BY mtime DESC LIMIT ?`;
+    const rows = db.prepare(sql).all(...params, limit);
+    const out = rows.map((r) => ({
+      path: toPosix(r.path),
+      rel: toPosix(r.rel),
+      root: toPosix(r.root),
+      name: r.name,
+      kind: r.kind,
+      ext: r.ext,
+      size: Number(r.size),
+      sizeText: formatBytes(Number(r.size)),
+      mtime: Number(r.mtime),
+      date: formatDate(Number(r.mtime)),
+      title: squeeze(r.title),
+    }));
+    out.total = Number(total);
+    out.hasMore = Number(total) > out.length;
+    return out;
+  }
+
   const sql = `SELECT root, path, rel, name, ext, kind, size, mtime, is_text, denied, title
-               FROM files WHERE ${where.join(' AND ')}
+               FROM files WHERE ${whereSql}
                ORDER BY mtime DESC LIMIT ?`;
   params.push(limit);
   return db.prepare(sql).all(...params).map((r) => ({
@@ -329,4 +363,38 @@ function listDirectory(db, dirAbsPosix, opts) {
   return { dir: prefix, returned: items.length, hasMore, items };
 }
 
-module.exports = { searchFiles, listFiles, listDirectory, escapeLike, buildSnippet };
+/**
+ * 数一下有多少文件被 `denyRead` 挡住 —— 也就是**正文从未入库、检索永远查不到**的那些。
+ *
+ * 为什么单独有这个函数：`find_files` 返回「没有命中」时，调用方无从分辨
+ * 「真的没有这个文件」和「有这个文件，但被策略排除、我故意不给你看」。
+ * 实测过：`shilu-studio/.env` 明明在索引里（`list_directory` 列得出来），
+ * 但搜 `.env` 返回 0 条，且没有任何提示 —— 同一份数据，列目录说「有」，搜索说「没有」。
+ *
+ * 被排除是有意的（见 隐私.md），但**沉默的排除和不存在的排除必须能区分开**。
+ */
+function countDenied(db, opts) {
+  const o = opts || {};
+  const where = ['gone = 0', 'denied = 1'];
+  const params = [];
+  if (o.root) {
+    const roots = Array.isArray(o.root) ? o.root : [o.root];
+    where.push('(' + roots.map(() => 'root = ?').join(' OR ') + ')');
+    params.push(...roots);
+  }
+  if (o.pathPrefix) {
+    const p = toPosix(o.pathPrefix).replace(/\/+$/, '');
+    where.push("(rel LIKE ? ESCAPE '\\' OR rel = ?)");
+    params.push(escapeLike(p) + '/%', p);
+  }
+  // 按名字/相对路径做子串匹配，用来回答一个具体问题：
+  // 「我搜 `.env` 返回 0 条 —— 是真的没有，还是你不给我看？」
+  if (o.nameLike) {
+    const like = '%' + escapeLike(String(o.nameLike).toLowerCase()) + '%';
+    where.push('(lower(name) LIKE ? ESCAPE \'\\\' OR lower(rel) LIKE ? ESCAPE \'\\\')');
+    params.push(like, like);
+  }
+  return Number(db.prepare(`SELECT count(*) AS c FROM files WHERE ${where.join(' AND ')}`).get(...params).c);
+}
+
+module.exports = { searchFiles, listFiles, listDirectory, countDenied, escapeLike, buildSnippet };

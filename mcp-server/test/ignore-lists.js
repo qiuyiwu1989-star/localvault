@@ -178,6 +178,43 @@ const swiftSrc = fs.readFileSync(SWIFT, 'utf8');
     cfg.ignoredDirs.includes('.aws'), '它以前只靠「config 没有扩展名」这个巧合挡着');
 }
 
+// ── 文档里写的条数必须等于代码里的条数 ─────────────────────────────
+//
+// 为什么值得单列一条：这两张默认表是**公开承诺**的一部分 —— README 和 隐私.md
+// 都写着「N 条」好让读者判断这条防线有多厚。改代码时最容易忘的就是它。
+// 实测发生过：给 denyRead 补 kubeconfig 写法、给 ignoredDirs 补 `.aws` 之后，
+// 文档里那两个数字当场就旧了（28/66 vs 真实 30/67），而没有任何东西会提醒。
+//
+// 一条会红的断言，比「记得改文档」可靠。
+{
+  const { DEFAULT_DENY_READ: DR, DEFAULT_IGNORED_DIRS: DI } = require('../lib/config');
+  const fsx = require('node:fs');
+  const root = path.join(ROOT, '..');
+  const docs = [
+    { file: 'README.md', n: DR.length, what: 'denyRead' },
+    { file: 'README.md', n: DI.length, what: 'ignoredDirs' },
+    { file: '隐私.md', n: DR.length, what: 'denyRead' },
+  ];
+  for (const { file, n, what } of docs) {
+    const text = fsx.readFileSync(path.join(root, file), 'utf8');
+    // 找「N 条 ... denyRead」或「N 个 ... 目录」这类说法
+    // 两种写法都要认：README 写「30 条清单」，隐私.md 写「（共 30 条）」。
+    // 只认一种的话，另一种会以「找不到说法」的形式失败 —— 看起来像断言写错，
+    // 实际是文档换了措辞。断言应该盯**数字**，不该盯措辞。
+    const re = what === 'denyRead'
+      ? new RegExp(`(\\d+)\\s*条清单|（共\\s*(\\d+)\\s*条）`)
+      : new RegExp(`(\\d+)\\s*个机器生成目录`);
+    const m = text.match(re);
+    if (!m) {
+      check(`${file} 里写明了 ${what} 的条数`, false, '找不到「N 条清单」/「N 个机器生成目录」的说法');
+      continue;
+    }
+    const shown = Number(m[1] ?? m[2]);
+    check(`${file} 里的 ${what} 条数与代码一致`, shown === n,
+      `文档写 ${shown}，代码是 ${n} —— 改表时必须同时改文档`);
+  }
+}
+
 console.log(`\n通过 ${passed} · 失败 ${failed}`);
 if (failed > 0) { console.log('默认规则表分叉或叠加行为不对。'); process.exitCode = 1; }
 else { console.log('两张表一致，叠加行为正确。'); process.exitCode = 0; }
