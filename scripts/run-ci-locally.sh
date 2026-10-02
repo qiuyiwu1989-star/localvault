@@ -52,7 +52,7 @@ step "恒真断言扫描" python3 "$HERE/check-assertions.py"
 # 四个测试直接跑 node —— 本地没有 npm（CI 上有）。测试内容完全一样。
 run_tests() {
   local d="$REPO/mcp-server"
-  for t in ignore-lists smoke clean-machine upstream mcp-handshake; do
+  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args no-network; do
     printf '   %-15s ' "$t"
     if (cd "$d" && "$NODE" "test/$t.js" >/tmp/ci-$t.log 2>&1); then
       grep -E "^通过|通过 [0-9]+ 项" /tmp/ci-$t.log | tail -1

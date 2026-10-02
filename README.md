@@ -1,485 +1,356 @@
 # localvault · 本地上下文
 
-**把你的电脑变成 agent 能读懂的上下文。**
+**把你指定的本机目录索引成 agent 能直接检索的本地上下文，并提供一套只读的文件治理体检。**
 
-`localvault` 把你指定的本机目录索引成 agent 可以直接检索的上下文，并提供一套**只读**的
-文件治理体检。它回答的不是「我的硬盘上有什么」，而是：
+一句话说清它是什么：它把「这台机器上有什么」变成可查的事实 —— 索引在本机、交给 agent 查、
+体检只出报告。索引库落在 `~/.localvault/`，不出这台机器。
 
-- **哪些文件值得花时间读** —— 一条六级的注意力梯子，见下
-- **这些文件讲了一件什么事** —— 一次调用把工作区地图书注入 agent 的系统提示词
-- **哪里在悄悄浪费空间** —— 重复文件、陈旧文件、断链、该归档没归档
+当前版本 **1.1.1**　|　零第三方依赖（只用 Node 内置模块 + `node:sqlite`）　|　CLI 需要 Node ≥ 22.5；macOS App 不需要 Node
 
-![六级注意力梯子](app/docs/提炼-六级梯子-概览-2026-10-02.png)
+**装它要付出的代价，就两样：** 一次 Gatekeeper 放行（未公证的 adhoc 签名包，客观上的手动步骤），
+以及一个数据目录 `~/.localvault/`（可随时整个删掉，见 [卸载.md](卸载.md)）。
+你的文件**只读**，索引**不上传**。
 
-```sh
-localvault init          # 探测 ~/Desktop 与 ~/Downloads，写出本机配置
-localvault index         # 建索引（首次几秒到几分钟）
-localvault setup-dsh     # 生成 MCP 插件配置
-```
+<!-- 浅色版；深色版把 light 换成 dark。全部由 scripts/screenshot.sh 生成，用的是一份夹具数据。 -->
+![界面](docs/screenshot-overview-light.png)
 
-## 两条不变量
-
-这个软件的一切设计都从这两条推出来。它们不是宣传语，是**代码里守着的**：
-
-**1. 这个软件不会动你的文件。**
-它不移动、不改名、不删除你的任何东西。`vault_audit` 和 `propose_organize` 只出报告 ——
-`propose_organize` 连"往哪放"都只在你自己配了 `policy.inboxDir` 之后才敢说。
-
-「只读」到底指什么，分三层说 —— **这三层的答案不一样，混起来讲就是骗人**：
-
-| | 读 / 写 | 说明 |
-| --- | --- | --- |
-| **你的文件** | 只读 | 硬承诺。CLI 和 App 都不写 |
-| **它自己的索引库** `~/.localvault/` | CLI **要写** | `index` 本来就是写库。删掉这个目录等于没装过 |
-| **App 读索引库** | 只读 | 以 `file:...?mode=ro` 打开，写操作被拒绝 |
-
-那条「写操作被拒绝」的断言在 **App 自检**里（`LocalVault --selftest`），
-**不在** `localvault doctor` 里 —— `doctor` 只检查环境和可读性。
-
-**2. 索引不出这台机器。**
-零运行时依赖、零网络请求、零遥测。没有云、没有服务器、没有隧道、没有 embedding ——
-只用 Node 内置模块 + `node:sqlite`。
-
-「零依赖」和「零网络」都有实测支撑：24 个 `require` 目标里没有一个是第三方模块
-（只有 `node:fs/os/path/crypto/child_process/sqlite` ＋ 相对路径）；在索引进程存活期间
-用 `lsof -nP -a -p <pid> -i` 轮询，**零网络套接字**；再用猴子补丁拦 `net`/`dns`/`tls`/`http`/`https`/`fetch`
-重跑一遍，**零拦截**。
-
-至于**具体路径、目录名、文档名**：`mcp-server/` 侧确实一个都没有（测试里有一条
-「隔离性」守卫，专门断言别的主目录上搜不到开发者的词）。这条守得比较严。
-
-> 什么叫「只读」的边界：它**读**你的文件来建索引。索引库在 `~/.localvault/`，
-> 删掉它等于没装过。
+> 截图里的内容是**夹具数据**（11 个文件），不是任何人的真实文件。
+> `sh scripts/screenshot.sh` 可以重新生成这一组图 —— 它自己造一份假 HOME、
+> 用完即删，所以这些图可以随界面一起自动更新，不会停在某个旧版本上。
+> 现有：`screenshot-overview-{light,dark}.png`（判断分布）、
+> `screenshot-detail-{light,dark}.png`（判断依据 + 正文）、
+> `screenshot-search-{light,dark}.png`（检索命中）。
 
 ---
 
-## 哪些文件值得读：六级梯子
+## 它能做什么
 
-这是这个项目最核心的一块，也是被实测推翻重做过的一块。
+三条，对应真实存在的命令与工具，不是方向性描述。
 
-| 级 | 名 | 证据（实测区分度） | 典型规模 |
+**1. 让 agent 查得到你的文件。**
+建好索引后，agent 通过 10 个只读 MCP 工具检索文件名、路径、文档标题、各级标题和正文
+（中文按子串匹配，2 个字就能命中），并能直接读正文。连上时还会自动注入一段「本机地图」：
+索引了哪些根、权威入口文档、顶层目录用途、台账概况、你自己规则文档里的规则原文。
+
+**2. 告诉你哪些文件值得读。**
+一条六级的注意力梯子：
+
+| 级 | 名 | 判据 | 典型文件 |
 | --- | --- | --- | ---: |
-| 0 | **务必读** | 项目入口文档（**3.08×**） | 71 |
-| 1 | **值得读** | 文档笔记 + 实质正文（**2.30×**） | 547 |
-| 2 | **值得扫** | 其余可读文档 | 118 |
-| 3 | **待定** | 图片/音视频/设计稿 —— 机器读不懂，**不冒充结论** | 466 |
-| 4 | **只检索** | 源码/数据/配置 —— agent 搜得到，不占你注意力 | 1,654 |
-| 5 | **不看** | 安装包、依赖、构建产物、重复件 | 6,985 |
+| 0 | 务必读 | 项目入口文档（实测区分度 3.08×） | 71 |
+| 1 | 值得读 | 文档笔记 + 实质正文（2.30×） | 547 |
+| 2 | 值得扫 | 其余可读文档 | 118 |
+| 3 | 待定 | 图片/音视频/设计稿 —— 机器读不懂，**不冒充结论** | 466 |
+| 4 | 只检索 | 源码/数据/配置 —— 搜得到，不抢注意力 | 1,654 |
+| 5 | 不看 | 安装包、依赖、构建产物、重复件 | 6,985 |
 
-**为什么不是「值得了解 / 待定 / 没用」三档？** 因为那是量出来的错。旧的三档里
-「值得了解」不是被**选**出来的，是**过网后的默认值** —— 过了硬件滤网的 2,829 个里
-2,363 个（83.5%）都落进去。原因是它的四条正面信号里有三条几乎没有区分度：
+（数量是作者机器上的快照，见 [CHANGELOG.md](CHANGELOG.md) 的 1.1.0 一节；判定顺序与区分度证据也在那里。
+看你自己的分布用 App，或跑 `node cli.js coverage`。）
 
-| 正面信号 | 全库命中率 | 「值得了解」命中率 | 区分度 |
-| --- | ---: | ---: | ---: |
-| 90 天内改动 | 99.8% | 99.9% | **1.00×** |
-| 在项目目录里 | 100.0% | 100.0% | **1.00×** |
-| 人类命名 | 94.3% | 93.7% | **0.99×** |
-| 有可读正文 | 75.2% | 95.6% | 1.27× |
+**3. 告诉你哪里在浪费空间。**
+六项只读体检：内容完全重复的文件、超过阈值未改动的陈旧文件、命中你配置词表的版本化命名、
+收集目录积压、根目录散文件、Markdown 断链。报告只陈述事实，判定标准由你在 `policy` 配置里写。
 
-**一条信号如果在全库和某一档里命中率一样，它就不配当证据。** 按这个标准，
-「正文含第一人称『我』」1.23×、「正文含判断/认为/决定」1.26×、「正文长度」1.25×
-也都被删掉了 —— 反直觉，但 `.md` 和源码里到处都是「我」和「决定」。
-真正的信号是**位置与角色**，不是**内容措辞**。
-
-于是「值得了解」从 2,363 个收到 **736 个**（3.2×），而且每一级都拿得出区分度 > 2× 的证据。
-判定顺序本身也是设计：
-
-```
-不看 → 待定 → 务必读 → 只检索 → 值得读 / 值得扫
-```
-
-「务必读」排在「只检索」**之前** —— 入口文档即使躺在代码目录里也算，判的是它的**角色**，
-不是它装的东西。而 `.pdf` 不算入口文档：`Mac操作说明 完全指南.pdf`（别人的教程手册）
-曾经因为名字含「说明」混进「务必读」，实测事故。
+**它不动你的文件。** 体检（`vault_audit` / `audit`）和整理方案（`propose_organize` / `organize`）
+都只出报告，移动、改名、删除一律由你自己做。这是设计约束，不是当前版本的临时取舍。
 
 ---
 
-## 为什么是这个形状
+## 60 秒上手
 
-它是从一台**重型个人检索系统**反向推出来的假设。那套东西能跑，但它带着
-Postgres + pgvector + 向量模型 + SSH 隧道 + Electron 壳：隧道一断，整盘不可用。
+两条路，今天都能走。先选一条。
 
-那么反过来问一句 —— 如果 96% 的文件是暗的，**「让暗的变亮」这条主线，
-能不能先不背这些前提就拿到 80% 的收益？**
+### 路线 A：下载 dmg 打开（图形界面，不需要 Node）
 
-| | 重型那套（本项目的出发点） | 本地上下文 |
-|---|---|---|
-| 依赖 | Python + Postgres + pgvector + 向量模型 + Node/Electron | **无**（Node 内置 + `node:sqlite`） |
-| 启动前提 | 一条常驻隧道；**隧道断 = 全盘不可用** | 无前提 |
-| 进程数 | 多个后端进程 + Electron 壳 | 0（按需 stdio 子进程） |
-| 检索 | trigram + 向量 + 文件名兜底 | LIKE 子串（中文 2 字起） |
-| 索引速度 | — | 9,443 文件 / **2.6 秒**，增量 **0.4 秒** |
-| 索引体积 | 一个数据库服务 | 93.6 MB SQLite |
-| 写操作 | 作业系统能派活 | **不动你的文件**（但它写自己的索引库） |
-| 给 agent 的上下文 | 需 agent 主动调工具 | 同时经 MCP `instructions` **自动进系统提示词** |
+安装包在仓库里：`app/dist/本地上下文-1.1.1.dmg`（约 1.9 MB）。
 
-**它是互补的，不是替代的。** 向量语义检索、OCR、chunk 级质量判定这些东西，
-这里一概没有 —— 它们仍然值得存在，只是不必是**第一层**。
+要求：**Apple Silicon（arm64）+ macOS 14.0 或更高**。这个包实测是 arm64、`LSMinimumSystemVersion = 14.0`，
+Intel Mac 上跑不起来。
 
----
+1. 打开 dmg，把 `本地上下文.app` 拖进 `Applications`（dmg 里就是 `/Applications` 的软链）。
+2. **第一次打开会被 Gatekeeper 拦下。** 这个包是 adhoc 签名、没有公证票，拦截是预期行为，不是文件坏了。
+   放行三选一：
+   - **macOS 15 及以后**：先双击一次让它被拦，然后打开 **系统设置 → 隐私与安全性**，拉到底部
+     「安全性」区域会出现这个 App 的提示，点 **「仍要打开」**，系统再确认一次。
+   - **macOS 14 及更早**：Finder 里 **按住 Control 点（或右键）图标 → 「打开」→ 弹窗里再点一次「打开」**。
+     macOS 15 起 Apple 去掉了右键这条后门，只能走上面那条。
+   - **终端一条命令**（各版本等价、可脚本化）：
+     ```sh
+     xattr -l /Applications/本地上下文.app                                     # 先看有没有隔离属性
+     xattr -d com.apple.quarantine /Applications/本地上下文.app                 # 有就删掉
+     ```
+     第二条报 `No such xattr` 说明隔离属性本来就没有（例如用 `ditto` 拷的，或已经放行过），不用再执行。
+     **不要**用 `xattr -cr`：它会递归清掉所有扩展属性，一般不需要。
+3. 放行后双击打开。机器上还没有索引时，App 直接给首次运行向导：勾目录 → 建立 → 进主界面。
+   **建索引由 App 自己完成（原生索引器），不需要 Node，不需要命令行。**
+   默认只列出 `~/Desktop` 与 `~/Downloads`，不会默认索引整个主目录或「文稿」。
 
-## 实测（2026-10-01 快照，本机）
+> 为什么这一步消不掉：没有 Apple 开发者账号（$99/年）就签不出能让 Gatekeeper 放行的包。
+> 本机实测 `spctl -a -vvv --type execute` → `rejected`（exit 3）、`codesign -dvv` → `Signature=adhoc`、
+> `TeamIdentifier=not set`。逐项摩擦与原始输出见 [app/首次运行.md](app/首次运行.md)；
+> 「下载到打开一共几步、每步卡在哪」的核对单见 [开箱即用.md](开箱即用.md)。
 
-> **这一节是一个带日期的快照，不是当前值。** 索引是活的，文件一直在变 ——
-> 下面这些数字会漂。要看你自己的，跑 `localvault doctor`。
->
-> 已知漂移（2026-10-02 复测）：扫描 **9,887** 文件（不是 9,443）、
-> 可搜正文 **7,400 / 74.8%**（不是 7,315 / 77.5%）、`instructions` **8,300** 字节（不是 8,201）、
-> vault.db **93.6 MB**（不是 90 MB）。**只有六级梯子的分布没有漂**，因为它是判断逻辑的产物。
-
-```
-索引根：工作区 9,333 文件 / 16.7GB    桌面 9 / 1.19GB    下载 101 / 4.49GB
-扫描：9,443 文件 / 1,553 目录，跳过 206 个机器生成目录，2.6 秒，0 错误
-增量：0.4 秒（9,442 个文件复用，只有 1 个新文件被抽取）
-索引正文：84 MB → vault.db 90 MB
-instructions：8,201 字节 / 上限 32,768
-
-首次体检结果：
-  重复文件   346 组完全重复（可回收 10.45 GB）+ 6 组同名
-  陈旧文件   440 个 / 808MB 超过 180 天未动
-  命名违规   9 个「最终版/副本」类命名
-  待整理     1 个（0 个超期）
-  根目录     2 个规则外散文件、23 个分类目录
-  断链       12 条 / 检查 1,122 条本地链接
-```
-
-> **重复文件那一行修过一次，原来是错的。** 最初报「可回收 143MB」，真值是 **10.45 GB**，
-> 差了 72 倍。原因有两层，必须一起改：`maxBytes` 决定谁参与比对（512 MiB 上限把 164 个文件、
-> 22.82 GB 挡在门外），而 `budget` 是**累计**哈希预算 —— 最大的一组（3.33 GB）一进门就撑爆预算，
-> `break` 掉，一个都没算。两组上限同时放开到 4 GiB / 64 GiB 后才拿到真值（11.1 秒）。
-> 报告现在还会显式列出**哪些文件没参与比对**，不再把部分结果说成全部。
-
-> **命名检查做过一次收敛。** 最初用裸子串匹配，命中 130 个——但把内置 Python 运行时里的
-> `NEWS2x`、`PatternGrammar3.12.14.final.0.pickle`、`folder.gif`（含 `old`）、
-> `new-keystore.sh`（新建 keystore，不是"新版"）全算进来了。
-> 改成**词元边界 + 末尾锚定**、并排除 `node_modules`/`site-packages`/`dist`/`.app` 内部后，
-> 降到 **9 个**，且全是真命中（`mermaid-diagram (1).png`、`review-final.json` 等）。
-> 「文件名过长」也一并排除了内容寻址名（`<sha256>.json`）这类机器生成命名。
-
-### 覆盖度（`disk_coverage`）
-
-```
-9,444 个文件里有 7,315 个可搜正文（77.5%）——但按体量只有 0.4%（84.4MB / 22.4GB）
-
-已有正文      7,315  77.5%    84.4MB
-超限分块         49   0.5%     702MB
-需要格式解析     12   0.1%     165MB   ← pdf/docx/pptx
-需要 OCR        822   8.7%     168MB
-需要转录         63   0.7%    13.9GB   ← 体量最大的一档
-需要解包         43   0.5%    4.42GB
-需要查库         29   0.3%     897MB
-不必变亮        963  10.2%    2.14GB   ← 动态库/字体/机器包/模型权重
-按策略排除      148   1.6%
-```
-
-它把暗区**按变亮所需的代价**分层，而不是按文件类型——因为类型驱动不了动作，代价才能。
-报告里最该先看的是「**白捡**」（声明是文本却没抽到正文，零成本可修）和
-「**不必变亮**」（扣掉它之后的才是真正需要讨论的分母）。
-
-
----
-
-## 安装
-
-需要 **Node >= 22.5**（内置 `node:sqlite`）。低于此版本会给出明确提示而不是崩溃。
-
-两个部分，可以只用其中一个：
-
-| | 是什么 | 怎么装 |
-| --- | --- | --- |
-| **CLI + MCP** | 建索引 + 给 agent 用的 10 个工具 | 从源码装（见下） |
-| **Mac App** | 图形界面：提炼 / 云盘 / 检索库 | `.dmg` —— 见 [app/首次运行.md](app/首次运行.md) |
-
-> **这个包还没有发布到 npm。** `registry.npmjs.org/localvault` 目前是 404。
-> 所以现在**没有** `npx localvault` 可用 —— 从源码装：
+### 路线 B：从源码跑 CLI（需要 Node ≥ 22.5）
 
 ```sh
-git clone https://github.com/qiuyiwu1989-star/localvault.git
+git clone <仓库地址待补> localvault
 cd localvault/mcp-server
-node cli.js init          # 最稳的一条路：不需要 npm，只要有 node
-node cli.js index
+
+node --version              # 必须 ≥ 22.5；低于此版本会打印一行提示并 exit 2，不抛栈
+node cli.js init            # 探测 ~/Desktop 与 ~/Downloads，写出本机配置
+node cli.js index           # 建索引（首次几秒到几分钟，之后是增量的）
+node cli.js search 关键词    # 命令行检索
+node cli.js doctor          # 自检：Node / SQLite / 配置 / 索引 / instructions 字节数
 ```
 
-装成全局命令（有 npm 的机器）：
+> ⚠️ **仓库地址待补。** GitHub 公开仓库还没建（`git rev-list --count HEAD` = 16 个提交，
+> 但一个 remote 都没配），上面的 `<仓库地址待补>` 现在填不出来。地址一旦确定，这里换成真实 URL。
+
+要索引自己的目录，位置参数按 `路径:标签` 写：
 
 ```sh
-npm i -g .                # 之后就有 localvault 命令了
+node cli.js init ~/Documents/我的项目:工作区 ~/Desktop:桌面
 ```
 
-> **诚实标注**：`node cli.js` 这条路测过；**`npm i -g .` 没有实测** ——
-> 开发这套代码的机器上根本没装 npm（只有 DSH 自带的 node）。所以第一次在别的机器上
-> `npm i -g .` 时，如果 `bin` 软链或命令名有问题，请提 issue。
-> 不想装全局也可以一直用 `node <repo>/mcp-server/cli.js <命令>`。
+> **位置参数一律写在 `--force` 之前。** 实测的坑：`node cli.js init --force ~/x:标签` 会把
+> `~/x:标签` 当成 `--force` 的值吃掉，索引根静默退回默认的桌面与下载。
+> 正确写法：`node cli.js init ~/Documents/我的项目:工作区 --force`。
 
-> 发布之后会改成 `npm i -g localvault`。这一节以**实测**为准：包一旦上线，这行就换掉。
+已有配置时 `init` **只报告、不覆盖**（连你新给的位置参数也不会加进去），要重写必须加 `--force`；
+`--force` 会先把旧配置备份成 `~/.localvault/config.json.bak-<时间戳>`。改索引范围也可以直接编辑
+`~/.localvault/config.json` 的 `roots`，然后重跑 `index`。
 
-> **App 必须先有索引才能开。** 它读的是 `~/.localvault/vault.db`，那个库由 CLI 建。
-> 所以顺序永远是：先跑 CLI 的 `init` + `index`，再开 App。没有索引时 App 会明确告诉你
-> 该跑哪条命令，而不是白屏。
+### npm 装？现在不行
 
-### 0. 认一下这台机器（必做，一次性）
+这个包**还没有发布到 npm**。实测（2026-10-03）两个源都是 404：
 
 ```sh
-localvault init
+$ curl -s -o /dev/null -w '%{http_code}\n' https://registry.npmjs.org/localvault
+404
+$ curl -s -o /dev/null -w '%{http_code}\n' https://registry.npmmirror.com/localvault
+404
 ```
 
-零配置时它只探测**系统标准目录**（`~/Desktop`、`~/Downloads`；Linux 上会读
-`~/.config/user-dirs.dirs`），因为它们存在才索引，不存在就跳过。**不会**默认索引整个主目录。
-
-要指定自己的目录：
-
-```sh
-localvault init ~/Documents/我的项目:工作区 ~/Desktop:桌面
-```
-
-已有配置时 `init` **只报告、不覆盖**（要重写加 `--force`），并会提示哪个索引根已经不存在了。
-
-### 1. 建索引
-
-```sh
-localvault index           # 首次几秒到几分钟；之后增量
-localvault doctor          # 自检
-```
-
-### 2. 装 skill
-
-Agent skill 让模型知道**什么时候**该去查本地上下文（而不只是**能**查）。
-它只随源码仓库分发：
-
-```sh
-git clone https://github.com/qiuyiwu1989-star/localvault.git
-sh localvault/scripts/install-skill.sh
-```
-
-装到 `~/.agents/skills/local-context-mcp/SKILL.md`，即时生效、无需重启。
-
-> npm 包里**没有** skill，也没有 `install-skill` 命令 —— `npx localvault` 的用户拿不到它。
-> 这是当前的已知缺口，不是文档遗漏。
-
-### 3. 装 MCP（在 DSH 界面里）
-
-```sh
-localvault setup-dsh                   # 或 --out <目录>
-```
-
-这一步生成 `cordis.patch.yml`，**把路径绑定到你本机的安装位置**——所以它是「配置」，
-不是「硬编码」。生成后：侧边栏 **Plugins** → **Add plugin** → 填入命令打印的那个目录
-→ 安装完成后 **Enable now**。
-
-启用后模型会多出 `mcp__localvault__*` 工具，**系统提示词里自动带上工作区上下文**。
-卸载就在同一个页面上删掉这个 bundle。
-
-> bundle 只做一件事：往当前 profile 插入一行 `@deepseek-ai/dsh-mcp-client`
-> （`transport: stdio`）。没有 Host/Client 代码，不会劫持 harness 的任何行为。
+所以 `npm i -g localvault` / `npx localvault` **现在都不成立**，别照着写。包上线后会改这一节。
 
 ---
 
-## 工具
+## 接进 agent（MCP）
 
-| 工具 | 用途 |
-| --- | --- |
-| `vault_map` | 完整地图：索引范围、目录用途、权威入口、台账概况、类型分布、规则摘要 |
-| `disk_coverage` | 覆盖度报告：多少文件真正可搜，暗区**按变亮代价**分层（白捡 / 格式解析 / OCR / 转录 / 不必变亮） |
-| `find_files` | 中文子串检索（2 字起），匹配文件名 / 路径 / 标题 / 各级标题 / 正文；可按类型、扩展名、根目录、路径前缀、时间、体积过滤 |
-| `find_project` | 用项目名 / 域名 / 仓库名 / P 编号反查台账条目、卡片、资料目录 |
-| `read_text` | 读索引内任意文本文件正文（带行号、分段） |
-| `list_directory` | 列目录条目 |
-| `recent_changes` | 最近改动（默认 7 天），按顶层目录聚合 |
-| `vault_audit` | 治理体检：`duplicates` / `stale` / `naming` / `inbox`（未配置则跳过）/ `root_clutter` / `links` |
-| `propose_organize` | 出整理方案（**dry-run，不动文件**）；去向按 `policy.inboxDir`，未配置就只列不指路 |
-| `refresh_index` | 增量重建（默认后台子进程，不阻塞对话） |
+localvault 是一个标准 **stdio MCP server**，服务器名 `localvault`，入口是 `mcp-server/server.js`。
+接上以后，agent 会多出 `mcp__localvault__*` 前缀的 10 个只读工具（清单见下），
+并且 `initialize` 返回的 `instructions`（本机地图，默认上限 32768 字节）会成为系统提示词的一部分 ——
+「什么时候该去查本地上下文」不用你每次提醒。DSH 用户可以直接跑
+`node cli.js setup-dsh` 生成本机挂载补丁；其他客户端手工配 stdio 命令即可。
 
-**资源**（供 `read_mcp_resource` 按需读取）：
-`vault://map`（别名 `vault://overview`）、`vault://guide`、`vault://projects`、`vault://recent`、
-模板 `vault://file/{path}`。
-
-### 上下文注入
-
-MCP `initialize` 返回的 `instructions` 会成为系统提示词的一部分。内容是**从本机文件系统
-实时生成**的，不是手写的，也不进代码：
-
-- 索引了哪些根、多少文件、最新改动日期、数据基线
-- 权威入口文档（路径 + 标题 + 更新日期）—— 配置指定的优先，其余**自动发现**
-- 顶层目录的用途 —— 配置标注优先，否则从该目录内的 README/索引文档标题推断**并注明出处**
-- 台账概况（项目数、分组、基线）
-- 用户自己规则文档里的规则原文
-- 10 个工具的用法与边界
-
-**哪些是推断来的，报告里都标了来源。** 目录用途后面带「（据 `某文件`）」就是推断结果，
-引用前应当扫一眼那个文件确认。地图的 `discovery` 字段集中说明推断情况。
+**完整的接入步骤（DSH / Claude / Cursor 各怎么写、路径怎么填、装完怎么验证）见 [接进-agent.md](接进-agent.md)。**
+这一节不重复它的内容。
 
 ---
 
-## 边界
+## 常见问题
 
-- **只读。** 不移动、不重命名、不删除任何文件。整理方案永远是报告。
-- **密钥不读正文。** `.env`、`*.pem`、`*.key`、`*credential*`、`*secret*`、`id_rsa*` 等
-  只记录元数据；`read_text` 会明确拒绝并说明原因。
-- **不联网。** 全部本机。
-- **不跟随符号链接**（避免环与重复计数），只记一条元数据。
-- **跳过机器生成目录**：`node_modules`、`.git`、`dist`、`build`、`.venv`、`Pods` 等 50 余个。
-- `.app` / `.framework` 这类 bundle 目录**只记一条元数据、不展开**——所以"下载里有个解压出来的
-  ClashX.app（461 个文件）"这类问题看得见，但不会被 461 条噪声淹没。
+**第一次打开被 Gatekeeper 拦？**
+见上面「路线 A」的三条放行办法。这是未公证 + 带隔离属性的组合导致的，跟包本身坏没坏无关；
+清掉隔离属性后系统只校验签名完整性，而 adhoc 签名是自洽的（`codesign --verify --deep --strict` 实测 valid）。
 
-## 数据位置
+**需要什么 Node 版本？**
+CLI 需要 **≥ 22.5**。硬要求，原因是索引库用 Node 内置的 `node:sqlite`；低于此版本会给出明确提示
+并 `exit 2`。**只用 App 的话完全不需要 Node**。
 
-| 内容 | 路径 |
-| --- | --- |
-| 索引库 | `~/.localvault/vault.db` |
-| 配置 | `~/.localvault/config.json` |
-| 后台索引日志 | `~/.localvault/index.log` |
+**索引库在哪？**
+`~/.localvault/`：索引本体 `vault.db`，配置 `config.json`。数据目录可以用环境变量
+`LOCALVAULT_DATA_DIR` 改（`setup-dsh` 生成的补丁里会带上它）。完整清单见下面「数据位置」。
 
-改索引范围：编辑 `~/.localvault/config.json` 的 `roots`，然后重跑 `index`。常用字段：
+**索引有多快、占多大？**
+作者机器上的**带日期快照**，不是你能直接套用的数字：工作区 9,336 个文件 / 16.7GB 建出的
+`vault.db` = 101,289,984 字节（约 97 MiB，2026-10-03，另加约 16 MiB 的 `-wal`）；
+2026-10-01 那次快照里，扫描 9,443 个文件用 2.6 秒、增量 0.4 秒。
+索引是活的，看你自己的跑 `node cli.js doctor`。
 
-| 字段 | 说明 |
-| --- | --- |
-| `roots` | 索引根，`[{path,label,priority}]` |
-| `ignoredDirs` / `denyRead` | 跳过与只记元数据的规则 |
-| `policy.inboxDir` | 「收集目录」名，默认 `null` = 不做该项检查 |
-| `policy.projectCardDir` | 项目卡片目录，默认 `null` = 不做卡片关联 |
-| `policy.rootNavPatterns` | 根目录里哪些文件算「导航」不算散落；设 `[]` 则全部列出 |
-| `policy.versionNamePatterns` | 版本化命名词表，**默认值不代表规范** |
-| `policy.staleDays` 等 | 阈值 |
-| `canonicalDocs` / `dirNotes` / `ledgerFile` / `rulesFile` | **可选覆盖**；留空则自动发现 |
+**App 和 CLI 是什么关系？**
+两边都能建索引：App 用原生 Swift 索引器，CLI 用 Node。两边建出的库字段一致（有一条对拍断言守着，
+23 文件树与 3,013 文件树各比对 18 列，0 处不一致）。
+一个已知缺口：**App 向导建的库里没有「地图」和 MCP 的 `instructions`** —— 这两样目前只有 CLI 会写。
+所以用向导建完索引后，界面里的地图面板在干净机器上会是空的（检索、提炼正常）。
+要地图、或要把索引接给 agent，用 CLI 再跑一次 `index`。
 
-> v1 配置里的 `governance` 块会自动并入 `policy`，`versionSuffixPatterns` 会改名成
-> `versionNamePatterns` —— 老配置不用手改。
+**Linux / Windows 能用吗？**
+CLI 是 Node，跨平台。图形界面是 SwiftUI、macOS 14+ 专用，没有 Linux / Windows 版。
+
+**怎么彻底删掉？**
+见 [卸载.md](卸载.md)：删索引库、配置、App、CLI 与 skill —— 以及**删完还剩什么**。
 
 ---
 
-## 目录结构
+## 它不做什么
+
+- **不动你的文件。** 不移动、不改名、不删除。体检出报告，整理方案是 dry-run。
+- **不联网上传、不是云盘、不做云同步。** 索引只写本机 `~/.localvault/`；没有账号、没有服务器、
+  没有遥测，也没有跨设备同步。**全部代码只有一个网络出口**：`node cli.js upstream push` 与
+  `upstream compensate`（上游对接，首版只做归档）。它必须同时满足两条才会发请求 —— 环境变量
+  `LOCALVAULT_MEMORY_TOKEN` 已设置（只从环境读，代码里没有任何地方能传 Token 参数），
+  并且你手敲了这两个子命令。没设 Token 时一个请求都不发：这条有测试守着
+  （`node test/no-network.js`，26 条断言，把 `globalThis.fetch` 换成会记账的守卫来证明 0 是真的）。
+  索引、检索、体检、10 个 MCP 工具全程本机。
+- **不做 LLM 提炼。** 没有摘要、没有结论生成、不调用任何模型。
+- **不做语义检索。** 检索是子串匹配，不是向量检索。搜「我当年怎么开始创业的」这类意图查询会落空；
+  向量检索有价值，但它的代价（常驻服务 + 向量模型）不是这一层该背的。
+- **不索引非文本正文。** 图片、音视频、扫描件 PDF 只记元数据，内容不可搜。它不假装解决了这块。
+
+---
+
+## 架构
+
+`mcp-server/` 是一个零依赖的 Node 程序，CLI（`cli.js`）和 MCP server（`server.js`）共用同一套 lib：
+`walk.js` 遍历文件系统 → `extract.js` 抽标题与正文 → `store.js` 写进 `node:sqlite`
+（`~/.localvault/vault.db`）→ `vault.js` 结合库和磁盘生成「地图」与 `instructions` →
+`mcp.js` 把工具和资源按 JSON-RPC 暴露到 stdio。`governance.js` 与 `coverage.js` 全是只读统计。
+`config.js` 里的默认值不含任何具体工作区的路径、目录名或文档名 —— 零配置时只探测系统标准目录
+（`~/Desktop`、`~/Downloads`；Linux 上读 `~/.config/user-dirs.dirs`），其余靠自动发现或你显式配置。
+App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运行向导建索引那一次会写 `vault.db`。
 
 ```
 本地上下文MCP/
-├── README.md              项目门面
-├── CHANGELOG.md           更新日志
+├── README.md              本文（门面：是什么、怎么装、边界）
+├── 接进-agent.md          怎么接进 agent（MCP 配置）
+├── 卸载.md                怎么彻底删掉，以及删完还剩什么
+├── 隐私.md                隐私边界（唯一网络出口的触发条件、索引里存了什么）
+├── 开箱即用.md            「下载到打开」逐项摩擦核对单与实际卡点
+├── CHANGELOG.md           更新日志（六级梯子、事故与修复的来龙去脉）
+├── 上游对接-核查与方案.md / 下一步工作计划.md   内部规划与核查记录（只用工具的话不用读）
 ├── LICENSE                MIT
-├── mcp-server/            零依赖的 MCP 服务器（也带 CLI）
+├── docs/                  门面图与按页面命名的浅/深色界面截图
+├── mcp-server/            零依赖 MCP server + CLI
 │   ├── server.js          stdio 入口
-│   ├── cli.js             init / setup-dsh / index / reindex-cache / map / instructions /
-│   │                      search / project / audit / organize / coverage / doctor / ledger
-│   ├── lib/
-│   │   ├── config.js      通用默认值（零个人路径）+ 配置加载与 v1→v2 迁移
-│   │   ├── discover.js    从磁盘推断入口文档 / 目录用途 / 台账 / 规则文档
-│   │   ├── walk.js        文件系统遍历
-│   │   ├── extract.js     文本抽取（标题 / 各级标题 / 正文 / 本地链接）
-│   │   ├── store.js       SQLite（node:sqlite）
-│   │   ├── indexer.js     增量索引
-│   │   ├── search.js      子串检索 + 字段权重评分 + 摘要
-│   │   ├── coverage.js    覆盖度分层（暗区按「变亮代价」分档）
-│   │   ├── util.js        共用小工具
-│   │   ├── vault.js       地图、入口文档、台账、instructions 生成
-│   │   ├── governance.js  六项只读体检 + dry-run 整理方案
-│   │   └── mcp.js         MCP 协议层（工具 / 资源 / instructions）
-│   ├── test/smoke.js            95 项端到端测试（含真实 stdio 握手 + 通用性防回归守卫）
-│   └── test/clean-machine.js    31 项「另一台电脑」安装测试（见下）
+│   ├── cli.js             15 个命令（见下）
+│   ├── lib/               config / discover / walk / extract / store / indexer / search /
+│   │                      coverage / governance / vault / mcp
+│   ├── lib/upstream/      上游对接（默认不生效，见「它不做什么」）
+│   └── test/              smoke / clean-machine / ignore-lists / upstream / mcp-handshake / no-network
 ├── app/                   macOS 图形界面（SwiftUI）
-│   ├── Sources/LocalVault/    窗口 / 提炼 / 云盘 / 检索库 / 地图
-│   ├── docs/                  界面截图（含开发过程稿，约 16 MB —— 见下）
-│   ├── icon/                  图标源文件与候选稿
-│   ├── scripts_build_app.sh   构建 .app
-│   ├── scripts_make_dmg.sh    打包 .dmg
-│   ├── 首次运行.md           别的电脑上怎么装（含 Gatekeeper 说明）
-│   └── 设计契约.md           界面层的冻结约定
-├── bundle/                DSH bundle（package.json；cordis.patch.yml 是生成物，不在版本库）
-├── skill/local-context-mcp/ 给 agent 的 skill（不含任何具体工作区的内容）
-└── scripts/               install-skill.sh / install-bundle.sh
+│   ├── Sources/LocalVault/ 界面与原生索引器
+│   ├── docs/              界面截图（约 16 MB，含改版过程稿 —— 只看用法的话可以跳过）
+│   ├── dist/              构建产物（.dmg 与 .app，未进版本库）
+│   ├── 首次运行.md        别的电脑上怎么装（含 Gatekeeper 的原始判定输出）
+│   └── 设计契约.md        界面层的冻结约定
+├── bundle/                DSH 插件补丁（cordis.patch.yml 是生成物）
+├── skill/local-context-mcp/  给 agent 的 skill（告诉模型「什么时候」该查本地上下文）
+├── scripts/               install-skill.sh / install-bundle.sh / CI 与断言扫描
+└── .github/workflows/     CI
 ```
 
-> **仓库里最重的是截图。** 18.1 MB 的跟踪内容里，`app/docs/` 占 16.1 MB（20 张，含若干
-> 「改版前」这类过程稿），`app/icon/` 占 1.1 MB（含 18 个候选/中间产物，
-> 其中 `AppIcon.iconset/` 10 张可以由 `.icns` 重新生成）。源码本身只有 0.3 MB。
-> 如果你只关心怎么用，这两块都可以不看。
+### 命令（`node cli.js <命令>`，15 个）
 
-## 测试
+| 命令 | 做什么 |
+| --- | --- |
+| `init [路径:标签 …] [--force]` | 探测这台机器，写出本机配置。已有配置时只报告 |
+| `index [--full] [--root <路径>]` | 建索引（默认增量） |
+| `reindex-cache` | 只重建缓存的「地图 + instructions」，不扫盘 |
+| `map` | 打印工作区地图 |
+| `instructions` | 打印注入系统提示词的那段文字（字节数写到 stderr） |
+| `search <关键词…>` | 命令行检索 |
+| `project <关键词>` | 用名称/域名/仓库/编号反查项目 |
+| `audit [检查项]` | 文件治理体检（六项） |
+| `organize` | 整理方案，**dry-run** |
+| `coverage` | 覆盖度：暗区按「变亮要付什么代价」分层 |
+| `doctor` | 自检 |
+| `setup-dsh [--out <目录>]` | 生成本机 DSH 挂载补丁（默认写到 `bundle/`） |
+| `ledger` | 台账概况（项目数、分组、基线） |
+| `upstream <子命令>` | 上游对接；默认什么都不做，没有授权清单时连一个字节都不出去 |
+| `help` | 列出全部命令（`node cli.js --help`、`-h`、不带参数同效） |
+
+### MCP 工具（10 个，全部只读）
+
+| 工具 | 用途 |
+| --- | --- |
+| `vault_map` | 完整地图：索引范围、入口文档、目录用途、台账、类型分布、规则摘要 |
+| `disk_coverage` | 覆盖度：暗区按代价分层（白捡 / 格式解析 / OCR / 转录 / 不必变亮） |
+| `find_files` | 子串检索文件名/路径/标题/各级标题/正文，可按类型、时间、体积过滤 |
+| `find_project` | 项目名/域名/仓库名/编号反查台账条目、卡片与资料目录 |
+| `read_text` | 读索引内文本文件正文（带行号与上限） |
+| `list_directory` | 列目录条目 |
+| `recent_changes` | 最近改动（默认 7 天），按顶层目录聚合 |
+| `vault_audit` | 六项只读体检：duplicates / stale / naming / inbox / root_clutter / links |
+| `propose_organize` | 整理方案（dry-run，不动文件） |
+| `refresh_index` | 增量重建索引（默认后台跑，不阻塞对话） |
+
+资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，模板 `vault://file/{path}`。
+（另有别名 `vault://overview`，与 `vault://map` 同源，但不出现在资源列表里。）
+
+### 开发者：跑测试
 
 ```sh
 cd mcp-server
-node test/smoke.js               # 95 项端到端
-node test/clean-machine.js       # 31 项「另一台电脑」
+node test/smoke.js              # 端到端：真实索引 + 真实检索 + 真实 stdio 握手 + 通用性守卫
+node test/clean-machine.js      # 「另一台电脑装完配一下就能用」：造一个别人的主目录真跑一遍
+node test/no-network.js         # 没配 Token 时零网络请求（把 fetch 换成会记账的守卫来证明）
 ```
 
-> 用 `node` 直接跑，不需要 npm。`package.json` 里也有 `npm test` / `npm run test:clean`，
-> 但那是给有 npm 的机器准备的 —— **开发这套代码的机器上没有 npm**，所以
-> `npm i -g .` 这条安装路径**没有被实测过**（`node cli.js` 路径测过）。
->
-> `smoke.js` 必须在**有 `~/Desktop` 或 `~/Downloads` 的真实 HOME** 下跑：
-> 它有一条断言要求默认索引根真实存在。用假 HOME 跑会看到
-> `✗ 零配置默认根全部真实存在 —— []`，那是环境问题不是回归。
+> 实测（假 HOME）：`smoke.js` 通过 96 项 / 失败 0 项；`clean-machine.js` 通过 31 项 / 失败 0 项；
+> `no-network.js` 通过 26 项 / 失败 0 项。
+> `smoke.js` 要求你的 HOME 下真实存在 `~/Desktop` 或 `~/Downloads`（有一条断言要求默认索引根存在），
+> 缺了会报一条红 —— 那是环境问题，不是回归。
 
-### smoke.js —— 95 项
+---
 
-在临时目录里造一个迷你工作区，跑真实索引、真实检索、真实体检，并起真实的 stdio 子进程
-做 JSON-RPC 握手与工具调用。
+## 数据位置
 
-其中一组是**通用性防回归守卫**，把「这是通用软件」写成可执行的断言：
-源码里不许出现个人标识；`defaultConfig()` 不许含个人台账/规则/收集目录/入口文档；
-零配置必须能加载且默认根真实存在；`setup-dsh` 生成的补丁不许把任何工作区写死成索引根。
-
-### clean-machine.js —— 31 项
-
-**「每台电脑装完配一下就能用」这句话是被验证过的，不是被断言的。**
-
-它真的演一遍：按 `package.json` 的 `files` 清单打包 → 解到干净前缀（模拟 `npm i -g`）
-→ 造一个**别人的主目录**（英文内容、完全不同的目录结构）→ 只给 `HOME` 环境变量
-→ 跑 `init` / `index` / `search` / `coverage` / `audit`。
-
-其中最关键的一组断言是**隔离性**：在别人那台机器上，搜开发者工作区的词条必须**零命中**，
-`instructions` 与地图里也不许出现。（那些词写死在 `test/smoke.js` 与 `test/clean-machine.js`
-的禁词表里 —— 那是守卫，不是产品内容。）
-
-还故意放了一个和开发者工作区**同名的目录**（`Desktop/项目管理/`）当诱饵，验证它不会因为
-名字相同就被套用一套只属于那台机器的约定。
-
-最后一项验证**可配置性**：给这台机器配上它自己的 `policy.inboxDir`，检查立刻生效。
-
-打包规则本身也是被断言的：白名单只有 `README.md` 和 `LICENSE`，`test/` 和其他 `.md`
-不许进包 —— 而且有一条断言专门检查**白名单文件真的在包里**，否则规则退化成"什么都不检查"
-也会是绿的。这条断言做过变异测试（清空白名单 / 塞 `NOTES.md` / 塞 `test/`），三种都变红。
-
-## 通用性：三层，越往后越少用到
-
-装到别人电脑上要能用，就不能假定你的目录结构。所以配置分三层，**上一层有值就不看下一层**：
-
-| 层 | 内容 | 谁决定 |
+| 内容 | 路径 | 能否删 |
 | --- | --- | --- |
-| 1. 零配置 | 索引根探测系统标准目录；其余全部留空 | 代码（不含任何具体路径） |
-| 2. 自动发现 | 入口文档、目录用途、台账、规则文档**从磁盘推断** | 磁盘上的实际内容 |
-| 3. 显式配置 | `canonicalDocs` / `dirNotes` / `ledgerFile` / `rulesFile` / `policy.*` | 用户 |
+| 索引本体 | `~/.localvault/vault.db` | 能，重跑 `index` 或 App 向导会重建 |
+| 配置 | `~/.localvault/config.json` | 别手删，删了要重新认一遍目录 |
+| 配置备份 | `~/.localvault/config.json.bak-<时间戳>` | 能 |
+| 索引日志 | `~/.localvault/index.log` | 能 |
+| 判断/签字记录 | `~/.localvault/claims.db` | **不能**，App 用，它不可重建 |
+| 上游清单/账本 | `~/.localvault/upstream-manifest.json`、`upstream-ledger.db` | 只在用过 `upstream` 时出现 |
 
-自动发现能推出多少（在一份真实的 9,000 文件工作区上实测）：
+数据目录整体可以被环境变量 `LOCALVAULT_DATA_DIR` 指到别处。删除步骤见 [卸载.md](卸载.md)。
 
-```
-台账      → 项目管理/项目台账.json（117 个项目）      ← 完全靠文件名与结构推断
-规则文档  → 协作资料/文件管理规则.md
-入口文档  → 00-从这里开始.md 排第一（名字强度打分 + 层级惩罚）
-目录用途  → 逐目录取 README / 00-* / index 的标题，并记录出处
-```
+## 隐私
 
-**推断的东西一律标注来源。** 目录用途后带「（据 `某文件`）」就是推断的，要引用先确认那个文件。
-猜错时必须看得出是怎么猜的 —— 这是这个工具的一条硬规矩。
+**索引只写本机，不上传、不同步、不遥测。** 你的文件是只读的；密钥类文件
+（`.env`、`*.pem`、`*.key`、`*credential*`、`*secret*`、`id_rsa*`、`*kubeconfig*` 等）**只留元数据**：
+它们仍会在索引里占一行（路径、文件名、大小、时间），但标题与正文是空的，`read_text` 会明确拒绝
+读取并说明原因。
 
-刻意**没有**做成默认的东西，因为它们都是特定工作流，不是普遍需求：
+**这条防线只认文件名，得知道它的天花板**：一个名字无害、内容却是密钥的文件挡不住
+（实测 `集群.yaml` 会被正常索引）。所以别把密钥写进一个「看起来没关系」的文件里然后指望它被挡住 ——
+真正管用的边界是下面那句「不防本机」。另外 `.ssh` / `.gnupg` / `.kube` / `.docker` / `.aws`
+这几个目录是**整体跳过**的，连元数据都不记。
 
-| 项目 | 默认 | 想用就配 |
-| --- | --- | --- |
-| 「收集/待整理」目录检查 | 关闭 | `policy.inboxDir` |
-| 项目卡片关联 | 关闭 | `policy.projectCardDir` |
-| 版本化命名词表 | 中英默认词表 | `policy.versionNamePatterns` |
-| 「根目录该放什么」 | **不判定** | `policy.rootNavPatterns` 只定义哪些算导航文件 |
+符号链接不跟随（只记一条元数据）；
+`node_modules`、`.git`、`dist`、`build`、`.build`、`.venv` 等 66 个机器生成目录跳过；
+`.app` / `.framework` 这类 bundle 只记一条元数据、不展开内部文件。
 
-一条设计纪律：**通用软件没有资格定义「整洁」。** 它只报告事实（根目录有几个文件、
-有多少个重复、有多少天没动），判定标准由用户在 `policy` 里写。所以报告里写的是
-「命中你配置的词表」，不是「命名违规」。
+要装之前值得知道的一条：**索引库是明文 SQLite，没有加密**，`~/.localvault/` 目录也没有改权限。
+「不上传」防的是网络，不防本机 —— 同一台 Mac 上能读到这个文件的进程或本地账户就能读到里面的正文。
+
+完整的隐私边界（唯一网络出口的触发条件、`denyRead` 的 28 条清单、索引里到底存了什么、
+上游账本会存正文副本这几条）见 [隐私.md](隐私.md)。
 
 ## 已知限制
 
-- **无语义检索。** 搜"我当年怎么开始创业的"这种意图查询，这里只会做子串匹配。
-  这是刻意的取舍 —— 向量检索确实有价值，但它的代价是 Postgres + 常驻隧道 + 一个模型，
-  而这一层不值得背。
-- **不索引非文本。** 图片、音视频、扫描件 PDF 只记元数据，内容不可搜。
-  那是「96% 是暗的」里最大的一块，本工具**不假装解决了它**。
-- **mtime 会被设备迁移污染**。`stale` 检查基于 mtime，迁移过的盘上会失真。
-- **正文上限**：单文件抽取上限 2MB，入库正文上限 400,000 字符，超出会截断并标注。
-- **重名文件**：以绝对路径为唯一键，同名不同目录是两条记录（这是有意的，治理体检会另外报同名簇）。
+- **无语义检索**：只有子串匹配。
+- **不索引非文本**：图片、音视频、扫描件 PDF 只记元数据。
+- **mtime 会被设备迁移污染**：`stale` 检查基于 mtime，迁移过的盘上会失真。
+- **正文上限**：单文件抽取上限 2MB，入库正文上限 400,000 字符，超出截断并标注。
+- **重名文件**：以绝对路径为唯一键，同名不同目录是两条记录（有意的；体检会另外报同名簇）。
+
+## 待补与未实测（别当成事实）
+
+1. **GitHub 公开仓库地址** —— 一个 remote 都没配，`git clone` 那行填不出来。
+2. **npm 发布状态** —— 2026-10-03 实测为 404。包一旦发布，本节与「npm 装？现在不行」都要改。
+3. ~~**门面图缺失**~~ —— **已解决**：截图现在由 `scripts/screenshot.sh` 生成（夹具数据、可重复），
+   本文引用的文件名与 `docs/` 里的文件一一对上。旧记录：`docs/` 里当时已有按页面命名的浅/深色截图，
+   见文件开头那条说明）。门面图用哪张、叫什么名字，还没定。
+4. **`npm i -g .` / `npm rm -g localvault`** —— 开发这套代码的机器上没有 npm，**没有实测过**；
+   第一次在别的机器上装时如果 `bin` 软链或命令名有问题，请提 issue。
+5. **`upstream push` 的真实提交** —— 没有端点凭据，只跑过「没有授权清单就退出」这条路，
+   以及 `test/no-network.js` 里「没 Token 时零请求」那一组。
+6. **App 首次运行向导的完整体验** —— 没在第二台干净的 Mac 上走过（本机也没有把「点仍要打开」的
+   交互实测过，那一节是机制说明）。细则与免责范围见 [app/首次运行.md](app/首次运行.md)。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。
