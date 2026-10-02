@@ -688,7 +688,7 @@ enum VaultIndexer {
             ".terraform", ".serverless", ".aws-sam", "site-packages", ".ipynb_checkpoints",
             ".expo", ".angular", ".eslintcache",
             ".venv", "venv", "virtualenv", ".virtualenv",
-            ".ssh", ".gnupg", ".kube", ".docker", ".codex", ".claude", ".dsh",
+            ".ssh", ".gnupg", ".kube", ".docker", ".aws", ".codex", ".claude", ".dsh",
             ".zsh_sessions", ".zsh_history", ".DS_Store", "Caches", "Containers",
         ]
         // 删掉了原先那条「config.js 没有 `.build`，这里绝不能顺手补」的注释 ——
@@ -708,7 +708,9 @@ enum VaultIndexer {
             "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
             "*credential*", "*secret*", "*password*", "*passwd*", "*.kdbx",
             "*-service-account*.json", "*token*.json", ".credentials.yaml",
-            "*.mobileprovision", "*.ovpn", "*.kubeconfig",
+            "*.mobileprovision", "*.ovpn",
+            // 必须与 mcp-server/lib/config.js 逐字一致（test/ignore-lists.js 会比对）。
+            "*kubeconfig*", "*kube-config*", "*kube_config*",
         ]
 
         static let textExtensions: Set<String> = [

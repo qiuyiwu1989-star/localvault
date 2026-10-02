@@ -94,7 +94,9 @@ const DEFAULT_IGNORED_DIRS = [
   '.terraform', '.serverless', '.aws-sam', 'site-packages', '.ipynb_checkpoints',
   '.expo', '.angular', '.eslintcache',
   '.venv', 'venv', 'virtualenv', '.virtualenv',
-  '.ssh', '.gnupg', '.kube', '.docker', '.codex', '.claude', '.dsh',
+  // `.aws` 与 `.ssh`/`.gnupg`/`.kube`/`.docker` 同类：机器生成的凭据目录。
+  // 它以前不在表里，只靠「config 没有扩展名所以不算文本」这个巧合挡着 —— 巧合不算防护。
+  '.ssh', '.gnupg', '.kube', '.docker', '.aws', '.codex', '.claude', '.dsh',
   '.zsh_sessions', '.zsh_history', '.DS_Store', 'Caches', 'Containers',
 ];
 
@@ -140,7 +142,15 @@ const DEFAULT_DENY_READ = [
   'id_rsa*', 'id_dsa*', 'id_ecdsa*', 'id_ed25519*',
   '*credential*', '*secret*', '*password*', '*passwd*', '*.kdbx',
   '*-service-account*.json', '*token*.json', '.credentials.yaml',
-  '*.mobileprovision', '*.ovpn', '*.kubeconfig',
+  '*.mobileprovision', '*.ovpn',
+  // 从 `*.kubeconfig` 放宽成 `*kubeconfig*`：原写法只挡带后缀的，而**裸的 `kubeconfig`**
+  // 和 `kubeconfig.yaml` 都挡不住 —— 后者会真的把 token 抽进正文、还能搜出来（实测）。
+  // 更根本的一条：`.kube/` 之所以安全，靠的是它在上面的 ignoredDirs 里；
+  // 一旦这个文件被复制出 `.kube/`，那层保护就没了。
+  // 文件的安全性不该取决于它恰好坐在哪个目录。
+  // 三种写法都收：kubeconfig / kube-config / kube_config。
+  // 实测过 `.kube-config-prod.yaml` 能漏过去 —— 光收 `*kubeconfig*` 不够。
+  '*kubeconfig*', '*kube-config*', '*kube_config*',
 ];
 
 /** 允许抽取正文的扩展名（小写，含点）。 */

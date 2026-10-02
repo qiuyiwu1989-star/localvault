@@ -59,6 +59,19 @@ function errOut(...args) {
   process.stderr.write(args.join(' ') + '\n');
 }
 
+/**
+ * 不接值的开关。**必须显式列出来**，不能靠「下一个参数不以 -- 开头」来判断。
+ *
+ * 踩过的：`init --force ~/我的项目:工作区` —— 解析器把那个路径当成 `--force` 的**值**，
+ * 于是位置参数没了。结果不是报错说「--force 不接受值」，而是：
+ *   - 新机器上：打出 `init` 的用法提示（exit 1），用户看不出是自己参数写错还是程序坏了；
+ *   - 已有配置时：走「已存在，未改动」分支，**exit 0** —— 用户以为根加上了。
+ * 后者最糟：静默地做了别的事，还报成功。
+ *
+ * 判据不该是「值长什么样」，而是「这个开关本来收不收值」。
+ */
+const BOOLEAN_FLAGS = new Set(['force', 'full', 'json', 'help', 'h']);
+
 function parseArgv(argv) {
   const positional = [];
   const flags = {};
@@ -66,6 +79,12 @@ function parseArgv(argv) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
+      if (BOOLEAN_FLAGS.has(key)) {
+        // 当布尔处理。用户写在它后面的位置参数会正常落进 positional，
+        // 而不是被当成它的值吃掉。
+        flags[key] = true;
+        continue;
+      }
       const next = argv[i + 1];
       if (next && !next.startsWith('--')) {
         flags[key] = next;

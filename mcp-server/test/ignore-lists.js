@@ -149,6 +149,35 @@ const swiftSrc = fs.readFileSync(SWIFT, 'utf8');
   }
 }
 
+// ── 凭据文件不能只靠「它坐在哪个目录」来保护 ─────────────────────────
+//
+// 实测过的漏洞：`.kube/` 之所以安全，是因为 `.kube` 在 ignoredDirs 里。
+// 把同一个 kubeconfig **复制出 `.kube/`** 并起名 `kubeconfig.yaml`，
+// 它就会：正文入库 → 能被检索到 → `read_text` 返回 token。
+// 拿真的 token 串检索过，命中 3 条。
+//
+// 也就是说保护依赖了「这会一直待在原目录」这个巧合。巧合不算防护。
+// 下面几条把「靠文件名兜住」这件事钉住：名字像 kubeconfig 的，一律不读正文。
+{
+  const { loadConfig, buildDenyMatchers, isDeniedRead } = require('../lib/config');
+  const cfg = loadConfig();
+  const matchers = buildDenyMatchers(cfg.denyRead);
+
+  const 该挡 = ['kubeconfig', 'kubeconfig.yaml', 'kubeconfig.json', 'kubeconfig-prod.yaml',
+    'my-kubeconfig.yaml', 'prod.kubeconfig', 'KUBECONFIG',
+    '.kube-config-prod.yaml', 'kube_config.yaml'];
+  const 该放 = ['config.yaml', '说明.md', 'kube-notes.md'];
+
+  for (const n of 该挡) {
+    check(`凭据文件名兜住：${n}`, isDeniedRead(n, matchers), '靠目录保护会在文件被复制出去时失效');
+  }
+  for (const n of 该放) {
+    check(`不误伤普通文件：${n}`, !isDeniedRead(n, matchers), '过宽会让人搜不到自己的文档');
+  }
+  check('`.aws` 在默认忽略目录里（与 .ssh/.gnupg/.kube/.docker 同类）',
+    cfg.ignoredDirs.includes('.aws'), '它以前只靠「config 没有扩展名」这个巧合挡着');
+}
+
 console.log(`\n通过 ${passed} · 失败 ${failed}`);
 if (failed > 0) { console.log('默认规则表分叉或叠加行为不对。'); process.exitCode = 1; }
 else { console.log('两张表一致，叠加行为正确。'); process.exitCode = 0; }
