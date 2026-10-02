@@ -389,18 +389,26 @@ final class VaultStore: ObservableObject {
     /// 取一个真存在、且重复出现的词，`hitCount > 1` 就是必然的，那段断言才真在跑。
     func repeatingKeywordSample() -> String? {
         var candidates = 0
-        for asset in fetchTextAssets(limit: 8) {
+        // 取 40 个而不是 8 个：`fetchTextAssets` 按 `size DESC` 排，最大的那几个基本是
+        // 英文文档（README / 生成的 API 文档），只看前 8 个很容易一个中文词都取不到。
+        for asset in fetchTextAssets(limit: 40) {
             let body = String(fullBody(asset.id).prefix(4000))
             var run = ""
             var seen = Set<String>()
             for ch in body {
                 let isCJK = ch.unicodeScalars.allSatisfy { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
-                run = isCJK ? run + String(ch) : ""
-                guard run.count == 2, !seen.contains(run) else { continue }
-                seen.insert(run)
+                if isCJK { run.append(ch) } else { run = "" }
+                // 滑窗：每读到一个新字就产生一个新的二字组。
+                // 原来是 `guard run.count == 2` —— 一段连续中文里**只有头两个字**会成为
+                // 候选，后面的字永远测不到（"这里是项目资料" 只测得到「这里」）。
+                // 后果是整节检索断言（四十多条）在没有合适语料时整体静默跳过。
+                guard run.count >= 2 else { continue }
+                let bigram = String(run.suffix(2))
+                guard !seen.contains(bigram) else { continue }
+                seen.insert(bigram)
                 candidates += 1
-                if body.components(separatedBy: run).count - 1 >= 2 { return run }
-                if candidates >= 60 { break }
+                if body.components(separatedBy: bigram).count - 1 >= 2 { return bigram }
+                if candidates >= 500 { return nil }
             }
         }
         return nil
