@@ -32,6 +32,35 @@ if [ ! -d "$BUNDLE" ]; then
   exit 1
 fi
 
+# ── 拒绝打包一个「旧 App + 新 CLI」的镜像 ───────────────────────────
+#
+# 这不是假想的：实测发生过。改了 `VaultIndexer.swift`（CR/CRLF 归一化）之后
+# 只跑了 `swift build -c release`（更新 `.build/`），**没重跑本目录的
+# scripts_build_app.sh** —— 于是 dist/ 里的 App 二进制停在改动之前，
+# 而本脚本把新鲜的 `CLI/` 打进去，产出**新 CLI + 旧 App** 的 dmg。
+#
+# 后果不是「某个功能没生效」，而是**两套索引器对同一份文件给出不同结果**：
+# 同一棵树，用 dmg 里的 App 建索引和用 dmg 里的 CLI 建索引，搜出来的东西不一样。
+# 而两边各自都不报错。
+#
+# 所以：分包前比一次时间戳。App 二进制比任何 Swift 源码旧 → 直接拒绝。
+# 宁可让人多跑一条命令，也不要发一个内部自相矛盾的包。
+BIN="$BUNDLE/Contents/MacOS/${APP_NAME//本地上下文/LocalVault}"
+if [ ! -f "$BIN" ]; then
+  echo "找不到 $BIN —— dist/ 里的 .app 不完整，先跑：sh scripts_build_app.sh"
+  exit 1
+fi
+NEWEST_SWIFT="$(find Sources -name '*.swift' -newer "$BIN" -print -quit 2>/dev/null || true)"
+if [ -n "$NEWEST_SWIFT" ]; then
+  echo "❌ 拒绝打包：dist/ 里的 App 比源码旧。"
+  echo "   比它新的源码（例如 ${NEWEST_SWIFT}）"
+  echo "   App 二进制时间：$(stat -f '%Sm' "$BIN")"
+  echo ""
+  echo "   先重跑：sh scripts_build_app.sh"
+  echo "   （只跑 swift build 不够 —— 那只更新 .build/，不会重新组装 dist/）"
+  exit 1
+fi
+
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
   "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
 [ -n "$VERSION" ] || VERSION="0.0.0"

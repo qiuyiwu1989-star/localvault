@@ -487,6 +487,19 @@ enum VaultIndexer {
 
         var text = String(decoding: data, as: UTF8.self)
         if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+
+        // 换行归一化：CRLF / CR / LF 一律折成 LF —— 与 mcp-server/lib/extract.js 一致。
+        //
+        // 为什么必须在**入口**做：下面所有分行都按 `"\n"` 走（parseFrontmatter /
+        // collectHeadings / guessTitle）。不归一化的话，一份 CRLF 文件在
+        // `body.split(separator: "\n")` 之后第一段是 `"\r"`，而它**不是空白**
+        // （`CharacterSet.whitespaces` 不含 `\r`），于是被当成正文的第一行 ——
+        // 抽出来的标题可能是整个正文。CR-only 文件更是整份被当成一行。
+        //
+        // 实测的后果：同一棵树，App 索引器与 CLI 索引器给出不同的 title/headings，
+        // 于是**两套索引搜出来的结果不一样**。已在 scripts/ 的跨实现对拍里守着。
+        text = text.replacingOccurrences(of: "\r\n", with: "\n")
+        text = text.replacingOccurrences(of: "\r", with: "\n")
         out.truncated = data.count >= settings.maxTextBytes
 
         let ext = fileExtension((path as NSString).lastPathComponent)

@@ -119,7 +119,15 @@ function extractFile(file, opts) {
     if (looksBinary(slice)) {
       return { ok: true, title: '', headings: [], body: '', truncated: false, bytes: read, binary: true };
     }
-    let text = stripBom(slice.toString('utf8'));
+    // 换行归一化：CRLF / CR / LF 一律折成 LF。
+    //
+    // 为什么必须在**入口**做、而不是在各个分行点各补一次：
+    // 下游的分行、标题抽取、正文截断全都假设「一行 = 一段 `\n` 之间」，
+    // 少归一化一处，就有一种文件在这一处对、在另一处错。
+    // 实测过代价：App 侧的索引器只按 `"\n"` 分行，于是一份 CRLF 文件
+    // 抽出的标题是**整个正文**，CR-only 文件被当成一行 ——
+    // 同一个文件，App 建索引和 CLI 建索引，搜出来的结果不一样。
+    let text = stripBom(slice.toString('utf8')).replace(/\r\n?/g, '\n');
     const truncated = read >= maxBytes;
     const ext = path.extname(file).toLowerCase();
     const isMd = ext === '.md' || ext === '.markdown' || ext === '.mdx';
