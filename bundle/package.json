@@ -1,0 +1,12 @@
+{
+  "name": "@local/localvault-bundle",
+  "version": "1.1.0",
+  "private": true,
+  "description": "localvault：把本机指定目录索引成 agent 可检索的本地上下文，并提供只读的文件治理体检。零依赖，索引不出机器。",
+  "type": "module",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

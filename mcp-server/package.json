@@ -1,0 +1,51 @@
+{
+  "name": "localvault",
+  "version": "1.1.0",
+  "description": "把本机文件索引成 agent 可检索的本地上下文，并提供只读的文件治理体检。零依赖，索引不出机器。",
+  "type": "commonjs",
+  "main": "./server.js",
+  "bin": {
+    "localvault": "./cli.js"
+  },
+  "files": [
+    "cli.js",
+    "server.js",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qiuyiwu1989-star/localvault.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qiuyiwu1989-star/localvault/issues"
+  },
+  "homepage": "https://github.com/qiuyiwu1989-star/localvault#readme",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "test": "node test/smoke.js && node test/clean-machine.js",
+    "index": "node cli.js index",
+    "map": "node cli.js map",
+    "doctor": "node cli.js doctor",
+    "test:clean": "node test/clean-machine.js",
+    "pack": "npm pack"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "localvault",
+    "local-first",
+    "offline",
+    "context",
+    "index",
+    "file-search",
+    "agent",
+    "file-governance",
+    "sqlite"
+  ],
+  "dependencies": {},
+  "license": "MIT"
+}
