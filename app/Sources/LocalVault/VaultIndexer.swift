@@ -780,11 +780,19 @@ enum VaultIndexer {
         var extracted = Extracted()
     }
 
+    /// 把「本次扫描没见过」的行标成 `gone = 1`。
+    ///
+    /// **`scan_id` 也要一起更新**（2026-10-02 修，与 `lib/store.js` 同步）。
+    /// 原来只写 `gone = 1`，`scan_id` 保持旧值，「按 `scan_id` 增量枚举变化」
+    /// 就永远看不见删除 —— 筛不出来的东西不报错，只是那段代码从不执行。
+    /// 语义上也该更新：`scan_id` 是「最后一次触及这一行的扫描」，
+    /// 而把它标成 gone，就是这次扫描触及了它。
     private static func markGoneOlderThan(_ db: OpaquePointer, root: String, scanId: Int64) -> Int {
-        guard let stmt = prepare(db, "UPDATE files SET gone = 1 WHERE root = ? AND scan_id <> ? AND gone = 0") else { return 0 }
+        guard let stmt = prepare(db, "UPDATE files SET gone = 1, scan_id = ? WHERE root = ? AND scan_id <> ? AND gone = 0") else { return 0 }
         defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, root)
-        sqlite3_bind_int64(stmt, 2, scanId)
+        sqlite3_bind_int64(stmt, 1, scanId)
+        bindText(stmt, 2, root)
+        sqlite3_bind_int64(stmt, 3, scanId)
         guard sqlite3_step(stmt) == SQLITE_DONE else { return 0 }
         return Int(sqlite3_changes(db))
     }

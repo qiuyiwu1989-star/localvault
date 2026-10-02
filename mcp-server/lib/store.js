@@ -205,8 +205,22 @@ class BatchWriter {
 }
 
 /** 把本次扫描未出现的记录标记为 gone。 */
+/**
+ * 把「本次扫描没见过」的行标成 `gone = 1`。
+ *
+ * **`scan_id` 也要一起更新**（2026-10-02 修）。
+ *
+ * 原来只写 `gone = 1`，`scan_id` 保持旧值。后果：
+ * 「按 `scan_id` 增量枚举变化」**永远看不见删除** ——
+ * 因为被删的行 scan_id 还是上一次的，`WHERE scan_id > cursor` 筛不出来。
+ * 筛不出来的东西不会报错，只是那一段代码永远不执行。
+ *
+ * 语义上也该更新：`scan_id` 是「最后一次触及这一行的扫描」，
+ * 而把它标成 gone，就是这次扫描触及了它。
+ */
 function markGoneOlderThan(db, root, scanId) {
-  const res = db.prepare('UPDATE files SET gone = 1 WHERE root = ? AND scan_id <> ? AND gone = 0').run(root, scanId);
+  const res = db.prepare('UPDATE files SET gone = 1, scan_id = ? WHERE root = ? AND scan_id <> ? AND gone = 0')
+    .run(scanId, root, scanId);
   return res.changes || 0;
 }
 

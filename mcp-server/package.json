@@ -26,11 +26,12 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node test/smoke.js && node test/clean-machine.js",
+    "test": "node test/smoke.js && node test/clean-machine.js && node test/upstream.js",
     "index": "node cli.js index",
     "map": "node cli.js map",
     "doctor": "node cli.js doctor",
     "test:clean": "node test/clean-machine.js",
+    "test:upstream": "node test/upstream.js",
     "pack": "npm pack"
   },
   "keywords": [

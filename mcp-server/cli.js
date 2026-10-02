@@ -481,6 +481,14 @@ const COMMANDS = {
     for (const [g, c] of groups) out(`  - ${g}：${c}`);
     return 0;
   },
+
+  /**
+   * 上游对接（个人记忆中心）。**首版只归档**：不调用 LLM、不写正式记忆、
+   * 不做全量同步。子命令见 `lib/upstream/cli.js`。
+   */
+  upstream(args) {
+    return require('./lib/upstream/cli').upstreamCommand(args);
+  },
 };
 
 function main() {
@@ -500,7 +508,16 @@ function main() {
     return 1;
   }
   try {
-    return fn(args) || 0;
+    const r = fn(args);
+    // upstream 的 push/compensate 是异步的：把 rejection 也收成退出码，
+    // 否则未处理的 rejection 会让退出码变成 0（失败被读成成功）。
+    if (r && typeof r.then === 'function') {
+      return r.catch((e) => {
+        errOut(`命令 ${cmd} 失败：${(e && e.stack) || e}`);
+        return 1;
+      });
+    }
+    return r || 0;
   } catch (e) {
     errOut(`命令 ${cmd} 失败：${(e && e.stack) || e}`);
     return 1;
@@ -508,7 +525,9 @@ function main() {
 }
 
 if (require.main === module) {
-  process.exitCode = main();
+  const r = main();
+  if (r && typeof r.then === 'function') r.then((code) => { process.exitCode = code; });
+  else process.exitCode = r;
 }
 
 module.exports = { COMMANDS };
