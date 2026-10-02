@@ -32,9 +32,32 @@ printf '════ 公开发布前检查 ════\n\n'
 # 工作区干净不代表历史干净，而推上去的是**历史**。
 printf '1. 全历史凭据扫描\n'
 SEEN=0
+# 只看**新增行**（`^+`）。
+#
+# 理由不是「省事」，是语义：每一次「某行进入历史」都必然是某个 commit 里的
+# 一行 `+`。带 `-` 的行是它被删掉的那一刻 —— 而它当初被加进来时，早已作为
+# `+` 出现过一次。所以只看 `+` 不漏，反而去掉了大量噪声
+# （删除行、上下文行、diff 头）。
 scan_one() {
   local label="$1" pat="$2" hits
-  hits="$(git log -p --all 2>/dev/null | grep -nE "$pat" | head -5 || true)"
+  # 豁免：AWS 官方文档里公开发布的那个示例 key。
+  #
+  # 它不是凭据 —— 它是 AWS 自己在文档里用来演示「access key 长什么样」的串，
+  # 全世界的示例代码里都有。历史里出现过一次，是**本脚本早先版本的自检探针**。
+  #
+  # 这是**精确串**豁免（`grep -vF`），不是模式豁免：只滤掉这一个已知示例，
+  # 任何别的 AWS 形状的串照样会被抓到。用「模式级」白名单才会开洞，这个不会。
+  #
+  # 为什么不去改历史：仓库还没有远端，改历史技术上可行，
+  # 但会让所有已引用的 commit 哈希失效（多处文档和验收记录都引了哈希），
+  # 而代价换来的是「让一个不是密钥的东西从历史里消失」—— 不划算。
+  # 动态拼出来，免得源码自己又变成一条命中。
+  local doc_key
+  doc_key="AKIA$(printf 'IOSFODNN7EXAMPLE')"
+  hits="$(git log -p --all --unified=0 2>/dev/null \
+            | grep -E '^\+' | grep -vE '^\+\+\+' \
+            | grep -vF "$doc_key" \
+            | grep -nE "$pat" | head -5 || true)"
   if [ -n "$hits" ]; then
     bad "疑似 ${label}："
     printf '%s\n' "$hits" | sed 's/^/       /'
@@ -51,7 +74,15 @@ scan_one "JWT"             'eyJhbGciOi[A-Za-z0-9_-]{20}'
 
 # 反证：拿一个假密钥喂进**同一批模式**，必须命中。
 # 否则「没命中」可能只是模式写错了 —— 一个从不报警的扫描器等于没有扫描器。
-PROBE_HIT="$(printf 'aws_key = AKIAIOSFODNN7EXAMPLE\n' | grep -cE '(AKIA|ASIA)[0-9A-Z]{16}' || true)"
+# ⚠️ 探针串**不能在源码里拼成完整的一串**，否则扫描器会扫到它自己，
+# 把自检探针报成真凭据 —— 实测踩过：这一条让检查以
+# 「疑似 AWS access key」为由阻断了发布，而命中的是它自己的第 54 行。
+#
+# 一个会对自身误报的扫描器，人会学着忽略它 —— 那比没有扫描器更坏。
+# 所以拆成两段，运行时才拼起来：源码里不存在那个连续字符串，
+# 而真正喂进去测的东西仍然是货真价实的 AWS 形状。
+PROBE_KEY="AKIA$(printf 'IOSFODNN7EXAMPLE')"
+PROBE_HIT="$(printf 'aws_key = %s\n' "$PROBE_KEY" | grep -cE '(AKIA|ASIA)[0-9A-Z]{16}' || true)"
 if [ "${PROBE_HIT:-0}" -ge 1 ]; then
   ok "扫描器自检通过（喂假 AKIA 会命中，所以「没命中」才是真的干净）"
 else
