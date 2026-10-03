@@ -100,13 +100,38 @@ const CLAIMS = [
   { re: /(\d+)\s*个(?!只读)[^。\n]{0,12}工具/g, kind: 'tools', label: 'N 个工具' },
   { re: /工具[（(]\s*(\d+)\s*个/g, kind: 'tools', label: '工具（N 个' },
   { re: /(\d+)\s*个资源/g, kind: 'resources', label: 'N 个资源' },
+  // 「N 个命令」也要查 —— 第一版没写这一条，于是 README 里
+  // 「cli.js 15 个命令」漏了过去（实际 16 个，含 help）。
+  // 判据少一条，就有一类错误天然看不见。
+  { re: /(\d+)\s*个命令/g, kind: 'commands', label: 'N 个命令' },
   { re: /资源[（(]\s*(\d+)\s*个/g, kind: 'resources', label: '资源（N 个' },
 ];
+
+// ── CLI 命令：两张表都必须列全 ──────────────────────────────────
+//
+// `mcp-server/README.md` 的 CLI 表曾经停在 14 个（缺 `upstream` 和 `claims`），
+// 而 `cli.js` 里有 16 个。装上包的人按 README 找命令会找不到 —— 而且是
+// 「文档没写」而不是「功能没有」，他会以为是自己记错了。
+const cliSrc = fs.readFileSync(path.join(PKG, 'cli.js'), 'utf8');
+const cliBlk = cliSrc.slice(cliSrc.indexOf('const COMMANDS = {'));
+// 命令是 `COMMANDS` 对象上的方法：`  init(args) {`
+// （不是 `init: () => {}` —— 第一版按 `key:` 写，解析出 0 个，
+//   而下面那条「≥15」的断言当场把它抓出来了，没有静默通过。）
+// 两处坑，都靠下面「>=15 个」那条断言抓出来的（否则会静默只查一半）：
+//   1. 命令是方法、不是属性：`init(args) {`。第一版按 `key:` 写，解析出 0 个；
+//   2. `'setup-dsh'(args) {` 与 `'reindex-cache'() {` 的键**带引号**，
+//      且有几个方法没有参数 —— 不带引号、又要求 `(args)` 的正则只找到 9 个。
+// `help` 不在 COMMANDS 里（main() 里特判），单独补上。
+const cliNames = [...cliBlk.slice(0, cliBlk.indexOf('\n};'))
+  .matchAll(/^ {2}'?([a-z][a-z-]*)'?\(/gm)].map((m) => m[1]);
+if (!cliNames.includes('help')) cliNames.push('help');
+
 
 const EXPECTED = {
   'readonly-tools': readOnlyCount,
   tools: toolNames.length,
   resources: resourceUris.length,
+  commands: cliNames.length,
 };
 
 let claimCount = 0;
@@ -142,25 +167,6 @@ for (const u of resourceUris) {
   check(`README 提到资源 ${u}`, docText['README.md'].includes(u));
   check(`npm 包 README 提到资源 ${u}`, docText['mcp-server/README.md'].includes(u));
 }
-
-// ── CLI 命令：两张表都必须列全 ──────────────────────────────────
-//
-// `mcp-server/README.md` 的 CLI 表曾经停在 14 个（缺 `upstream` 和 `claims`），
-// 而 `cli.js` 里有 16 个。装上包的人按 README 找命令会找不到 —— 而且是
-// 「文档没写」而不是「功能没有」，他会以为是自己记错了。
-const cliSrc = fs.readFileSync(path.join(PKG, 'cli.js'), 'utf8');
-const cliBlk = cliSrc.slice(cliSrc.indexOf('const COMMANDS = {'));
-// 命令是 `COMMANDS` 对象上的方法：`  init(args) {`
-// （不是 `init: () => {}` —— 第一版按 `key:` 写，解析出 0 个，
-//   而下面那条「≥15」的断言当场把它抓出来了，没有静默通过。）
-// 两处坑，都靠下面「>=15 个」那条断言抓出来的（否则会静默只查一半）：
-//   1. 命令是方法、不是属性：`init(args) {`。第一版按 `key:` 写，解析出 0 个；
-//   2. `'setup-dsh'(args) {` 与 `'reindex-cache'() {` 的键**带引号**，
-//      且有几个方法没有参数 —— 不带引号、又要求 `(args)` 的正则只找到 9 个。
-// `help` 不在 COMMANDS 里（main() 里特判），单独补上。
-const cliNames = [...cliBlk.slice(0, cliBlk.indexOf('\n};'))
-  .matchAll(/^ {2}'?([a-z][a-z-]*)'?\(/gm)].map((m) => m[1]);
-if (!cliNames.includes('help')) cliNames.push('help');
 
 check('解析出了 CLI 命令（不是空数组）', cliNames.length > 0, `${cliNames.length} 个`);
 check('CLI 命令数 ≥ 15（少了说明解析错了，而不是命令变少了）', cliNames.length >= 15,

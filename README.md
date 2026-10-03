@@ -223,7 +223,7 @@ App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运�
 ├── docs/                  门面图与按页面命名的浅/深色界面截图
 ├── mcp-server/            零依赖 MCP server + CLI
 │   ├── server.js          stdio 入口
-│   ├── cli.js             15 个命令（见下）
+│   ├── cli.js             16 个命令（见下）
 │   ├── lib/               config / discover / walk / extract / store / indexer / search /
 │   │                      coverage / governance / vault / mcp
 │   ├── lib/upstream/      上游对接（默认不生效，见「它不做什么」）
