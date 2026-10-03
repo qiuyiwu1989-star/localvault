@@ -133,7 +133,7 @@ node cli.js setup-dsh
 
 接好之后，在 agent 里问一句能让它去列工具的话，比如「列出 localvault 提供的工具」。
 
-**你应该看到 10 个工具**：
+**你应该看到 12 个工具**：
 
 | 工具 | 干什么用 | 什么时候该让 agent 用它 |
 | --- | --- | --- |
@@ -147,10 +147,27 @@ node cli.js setup-dsh
 | `propose_organize` | 生成整理方案（dry-run） | 想动手整理前的「先看看会怎么整」 |
 | `disk_coverage` | 覆盖度报告：有多少文件真能搜到，暗区按「变亮要付什么代价」分层 | 「为什么我搜不到 XX」 |
 | `refresh_index` | 增量重建索引 | **你刚改过文件，要让 agent 看到最新的** |
+| `read_claims` | 读「你签过的判断」。默认当前状态，`history=true` 看完整事件流 | **正要建议删/归档某个文件之前先查** —— 你可能早就说过「这个别删」 |
+| `triage` | 把 agent 的观察追加成一条机器条陈（L0 待签），等你在 App 里批 | 让 agent 的推断留痕，但**不等于**它替你下判断 |
 
-**还有 4 个资源**（有些客户端会单独列出来）：
-`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，
+**还有 5 个资源**（有些客户端会单独列出来）：
+`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`、`vault://claims`，
 以及一个模板 `vault://file/{path}` 用来按路径读文件。
+
+### 判断记忆：为什么 agent 要读得出来
+
+App 的「提炼」页能签判断（保留 / 待看 / 可归档 / 可清理），存在 `~/.localvault/claims.db`。
+在这之前 **CLI 与 MCP 侧读不到它** —— 判断写得进、读不出来。于是 agent 永远不知道
+你已经说过「这个别删」，只能反复问，或者更糟：它以为自己知道。
+
+两条硬约束写在代码里，不是靠自觉：
+
+- **人和机器一眼可分。** 机器写的固定挂 `policy:localvault-agent`、`signed_by` 是策略名、
+  `actor_type='machine'`、权威级**只能是 L0 待签**。机器想签 L1 会被直接拒。
+- **只追加。** 撤回不是删除，是再追加一条「撤回」。数据库层装了触发器，
+  谁发 `UPDATE` / `DELETE` 都失败 —— **约束，不是自律。**
+
+命令行也能直接看：`node cli.js claims`（加 `--history` 看事件流，`--json` 给程序用）。
 
 ### 最有用的第一句
 

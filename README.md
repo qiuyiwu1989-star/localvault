@@ -240,7 +240,7 @@ App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运�
 └── .github/workflows/     CI
 ```
 
-### 命令（`node cli.js <命令>`，15 个）
+### 命令（`node cli.js <命令>`，16 个）
 
 | 命令 | 做什么 |
 | --- | --- |
@@ -258,11 +258,13 @@ App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运�
 | `setup-dsh [--out <目录>]` | 生成本机 DSH 挂载补丁（默认写到 `bundle/`） |
 | `ledger` | 台账概况（项目数、分组、基线） |
 | `upstream <子命令>` | 上游对接；默认什么都不做，没有授权清单时连一个字节都不出去 |
+| `claims [目标] [--history] [--json]` | 读「你签过的判断」。`--install-guards` 装上「只可追加」触发器 |
 | `help` | 列出全部命令（`node cli.js --help`、`-h`、不带参数同效） |
 
-### MCP 工具（10 个，全部只读）
+### MCP 工具（12 个：11 个只读 + 1 个只追加）
 
-| 工具 | 用途 |
+前 11 个**不写任何东西**。第 12 个 `triage` 只能**往判断记忆里追加**一条机器条陈
+（L0 待签）—— 不能改、不能删、不能替人签判断。数据库层有触发器兜底。
 | --- | --- |
 | `vault_map` | 完整地图：索引范围、入口文档、目录用途、台账、类型分布、规则摘要 |
 | `disk_coverage` | 覆盖度：暗区按代价分层（白捡 / 格式解析 / OCR / 转录 / 不必变亮） |
@@ -274,8 +276,10 @@ App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运�
 | `vault_audit` | 六项只读体检：duplicates / stale / naming / inbox / root_clutter / links |
 | `propose_organize` | 整理方案（dry-run，不动文件） |
 | `refresh_index` | 增量重建索引（默认后台跑，不阻塞对话） |
+| `read_claims` | 读「你签过的判断」：当前状态，或 `history=true` 看完整事件流 |
+| `triage` | **只追加**一条机器条陈（L0 待签），等人在 App 里批 |
 
-资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，模板 `vault://file/{path}`。
+资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`、`vault://claims`，模板 `vault://file/{path}`。
 （另有别名 `vault://overview`，与 `vault://map` 同源，但不出现在资源列表里。）
 
 ### 开发者：跑测试

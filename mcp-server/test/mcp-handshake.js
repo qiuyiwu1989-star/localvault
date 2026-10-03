@@ -114,8 +114,9 @@ function connect(dataDir) {
     // 这份名单是 `接进-agent.md` 里那张表的**逐字对应**。
     // 一边改了另一边没改 → 这条红。文档与代码谁先漂都会被抓住。
     const EXPECTED = ['vault_map', 'disk_coverage', 'find_files', 'find_project', 'read_text',
-      'list_directory', 'recent_changes', 'vault_audit', 'propose_organize', 'refresh_index'];
-    check('tools/list 恰好 10 个工具（与接进-agent.md 的表一致）',
+      'list_directory', 'recent_changes', 'vault_audit', 'propose_organize', 'refresh_index',
+      'read_claims', 'triage'];
+    check('tools/list 恰好 12 个工具（与接进-agent.md 的表一致）',
       names.length === EXPECTED.length, `实际 ${names.length}：${names.join(', ')}`);
     check('工具名单与文档里的那张表逐字相同',
       JSON.stringify(names) === JSON.stringify(EXPECTED),
@@ -132,7 +133,7 @@ function connect(dataDir) {
     // ── 资源与模板 ──────────────────────────────────────────────
     const res = await c.call('resources/list', {});
     const uris = ((res.result && res.result.resources) || []).map((r) => r.uri);
-    check('resources/list 有 4 个资源', uris.length === 4, uris.join(', '));
+    check('resources/list 有 5 个资源', uris.length === 5, uris.join(', '));
     check('vault://map 在资源里（文档让用户第一句就读它）', uris.includes('vault://map'));
 
     const tpl = await c.call('resources/templates/list', {});

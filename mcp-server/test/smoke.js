@@ -264,8 +264,8 @@ async function testMcp(fixture, dataDir) {
 
   const tools = await send('tools/list', {});
   const names = ((tools.result && tools.result.tools) || []).map((t) => t.name);
-  check('tools/list 返回 10 个工具', names.length === 10, `实际 ${names.length}：${names.join(',')}`);
-  for (const expected of ['vault_map', 'disk_coverage', 'find_files', 'find_project', 'read_text', 'list_directory', 'recent_changes', 'vault_audit', 'propose_organize', 'refresh_index']) {
+  check('tools/list 返回 12 个工具', names.length === 12, `实际 ${names.length}：${names.join(',')}`);
+  for (const expected of ['vault_map', 'disk_coverage', 'find_files', 'find_project', 'read_text', 'list_directory', 'recent_changes', 'vault_audit', 'propose_organize', 'refresh_index', 'read_claims', 'triage']) {
     check(`工具 ${expected} 存在且带 inputSchema`, names.includes(expected) && Boolean(tools.result.tools.find((t) => t.name === expected).inputSchema));
   }
 
@@ -323,7 +323,7 @@ async function testMcp(fixture, dataDir) {
   check('propose_organize 只出报告', Boolean(orgText) && orgText.includes('没有执行任何改动'));
 
   const resList = await send('resources/list', {});
-  check('resources/list 返回 4 个资源', resList.result && resList.result.resources.length === 4);
+  check('resources/list 返回 5 个资源', resList.result && resList.result.resources.length === 5);
   const tmpl = await send('resources/templates/list', {});
   check('resources/templates/list 有 file 模板', tmpl.result && tmpl.result.resourceTemplates.some((t) => t.uriTemplate.includes('vault://file/')));
 

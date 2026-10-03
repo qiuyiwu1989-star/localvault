@@ -94,7 +94,7 @@ done
 # 加新测试时**这里和 package.json 的 test 脚本都要加**，两处必须一致。
 run_tests() {
   local d="$REPO/mcp-server"
-  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network scan-integrity package-integrity; do
+  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network scan-integrity package-integrity claims; do
     printf '   %-15s ' "$t"
     if (cd "$d" && "$NODE" "test/$t.js" >/tmp/ci-$t.log 2>&1); then
       grep -E "^通过|通过 [0-9]+ 项" /tmp/ci-$t.log | tail -1

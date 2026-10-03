@@ -235,6 +235,46 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'read_claims',
+    description:
+      '读「你签过的判断」（判断记忆）。人签的判断不能由这里产生、也不能改：这里只读。' +
+      '默认返回**当前状态**（每个目标最新一条，撤回的不在内）；传 history=true 看完整事件流（含撤回与机器备注）。' +
+      '当你正要建议删除或归档某个文件之前，**先查这里** —— 用户可能早就说过「这个别删」。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: '只看某个目标（一般是文件路径）。' },
+        targetType: { type: 'string', enum: ['file', 'dir', 'project'], description: '目标类型。' },
+        kind: { type: 'string', description: '只看条陈类型：event/material/fact/judgment/consequence。' },
+        actorType: { type: 'string', enum: ['human', 'machine'], description: '只看是谁写的。' },
+        verdict: { type: 'string', description: '只看某个判断词（保留/待看/可归档/可清理）。' },
+        since: { type: 'string', description: '时间窗口，如 "30d"、"3周"。' },
+        history: { type: 'boolean', description: 'true 表示返回完整事件流而不是当前状态。' },
+        limit: { type: 'number', description: '最多返回条数，默认 200，上限 5000。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown。' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'triage',
+    description:
+      '把 agent 的观察**追加**成一条机器条陈（L0 待签），等人在 App 里批。' +
+      '这不等于替人下判断：机器写的东西固定挂在 policy:localvault-agent 名下、权威级 L0，数据层就分得清人和机器。' +
+      '**不能签人的判断，不能改任何已有条陈。**',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: '目标（一般是文件路径）。' },
+        targetType: { type: 'string', enum: ['file', 'dir', 'project'], description: '默认 file。' },
+        note: { type: 'string', description: '要记下的观察。' },
+        kind: { type: 'string', description: '默认 material。' },
+      },
+      required: ['target', 'note'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 /* ------------------------------------------------------------------ *
@@ -246,6 +286,7 @@ const STATIC_RESOURCES = [
   { uri: 'vault://guide', name: '使用指南与边界', description: '这些工具能做什么、不能做什么，以及先读什么', mimeType: 'text/markdown' },
   { uri: 'vault://projects', name: '项目清单', description: '来自本机台账文件的项目列表（位置由配置或自动发现决定）', mimeType: 'text/markdown' },
   { uri: 'vault://recent', name: '最近改动（7 天）', description: '最近 7 天修改过的文件', mimeType: 'text/markdown' },
+  { uri: 'vault://claims', name: '你签过的判断', description: '判断记忆的当前状态：每个目标最新一条，撤回的不在内。只读', mimeType: 'text/markdown' },
 ];
 
 const RESOURCE_TEMPLATES = [
@@ -473,11 +514,115 @@ class LocalVaultServer {
         return this.toolProposeOrganize(args);
       case 'refresh_index':
         return this.toolRefreshIndex(args);
+      case 'read_claims':
+        return this.toolReadClaims(args);
+      case 'triage':
+        return this.toolTriage(args);
       default: {
         const err = new Error(`未知工具：${name}`);
         err.jsonRpcCode = -32602;
         throw err;
       }
+    }
+  }
+
+  /**
+   * 读判断记忆。
+   *
+   * **读就是读：这个函数不写任何东西。** 装「只可追加」的 TRIGGER 不在读路径上 ——
+   * 一个读取工具去改文件，是那种「平时没事、出事时解释不清」的设计。
+   * 触发器的安装放在写路径（`triage`）与 `localvault claims --install-guards`。
+   */
+  toolReadClaims(args) {
+    const a = args || {};
+    const C = require('./claims');
+    const { parseSince } = require('./util');
+    const cfg = this.prepare();
+    const r = C.openClaims(cfg, { readOnly: true });
+    if (!r.ok) {
+      // 「库不存在」不是错误，是一种事实：还没有人签过任何判断。
+      return { text: `（${r.reason}）` };
+    }
+    try {
+      const sinceMs = a.since ? (parseSince(a.since) || 0) : 0;
+      const list = C.listClaims(r.db, {
+        target: a.target, targetType: a.targetType, kind: a.kind,
+        actorType: a.actorType, sinceMs, limit: a.limit || 200,
+      });
+      // `verdict` 过滤只对当前状态有意义（历史里的判断可能已经被撤回）。
+      let rows = list.rows;
+      if (a.verdict) rows = rows.filter((c) => c.verdict === a.verdict);
+
+      const sum = C.summary(r.db);
+      if (a.format === 'json') {
+        if (a.history) {
+          return { text: JSON.stringify({ total: list.total, shown: list.shown, claims: rows, summary: sum }, null, 2) };
+        }
+        const proj = C.projectCurrent(C.listClaims(r.db, {
+          target: a.target, targetType: a.targetType, actorType: a.actorType, limit: 5000,
+        }).rows);
+        const current = [...proj.values()].filter((c) => !a.verdict || c.verdict === a.verdict);
+        return { text: JSON.stringify({ current, summary: sum }, null, 2) };
+      }
+
+      if (a.history) return { text: C.renderHistoryMarkdown(rows, list.total, list.shown) };
+
+      const proj = C.projectCurrent(C.listClaims(r.db, {
+        target: a.target, targetType: a.targetType, actorType: a.actorType, limit: 5000,
+      }).rows);
+      const entries = new Map([...proj].filter(([, c]) => !a.verdict || c.verdict === a.verdict));
+      const md = C.renderCurrentMarkdown(entries, { limit: a.limit || 200, signer: sum.signer });
+      return { text: md + '\n\n' + this.claimsSummaryLine(sum) };
+    } finally {
+      try { r.db.close(); } catch { /* 关不掉不影响结果 */ }
+    }
+  }
+
+  claimsSummaryLine(s) {
+    const parts = Object.entries(s.byVerdict).filter(([, n]) => n > 0).map(([k, n]) => `${k} ${n}`);
+    const bits = [
+      `事件流 ${s.eventCount} 条`,
+      `当前 ${s.currentTargets} 个目标`,
+      parts.length ? parts.join(' · ') : '还没有判断',
+      `机器备注 ${s.machineNotes} 条（L0 待签）`,
+    ];
+    if (s.retractedTargets) bits.push(`已撤回 ${s.retractedTargets} 个`);
+    return `> ${bits.join(' · ')}`;
+  }
+
+  /**
+   * 机器写一条 L0 待签条陈。
+   *
+   * 这里**只增不改**：`lib/claims.js` 里没有 UPDATE/DELETE，数据库里还有触发器兜底。
+   * 人也别想通过这里签判断 —— `appendClaim` 会拒掉「机器 + verdict」。
+   */
+  toolTriage(args) {
+    const a = args || {};
+    if (!a.target || !String(a.note || '').trim()) {
+      const err = new Error('需要 target 与 note');
+      err.jsonRpcCode = -32602;
+      throw err;
+    }
+    const C = require('./claims');
+    const cfg = this.prepare();
+    // 写路径：库不在就建。读路径（read_claims）不建 —— 见 lib/claims.js 的注释。
+    const r = C.openClaims(cfg, { create: true });
+    if (!r.ok) return { text: `写不进去：${r.reason}` };
+    try {
+      const res = C.annotate(r.db, {
+        target: String(a.target),
+        targetType: a.targetType || 'file',
+        note: String(a.note),
+        kind: a.kind || 'material',
+      });
+      if (!res.ok) return { text: `没有写入：${res.reason}` };
+      return {
+        text: `已追加一条机器条陈（id ${res.id}，L0 待签，挂 ${C.MACHINE_POLICY}）。\n` +
+          `这是**待签**，不是判断 —— 人在 App 的「提炼」页批过之后才算数。\n` +
+          `已有的条陈一条都没被改动（只追加）。`,
+      };
+    } finally {
+      try { r.db.close(); } catch { /* 关不掉不影响结果 */ }
     }
   }
 
@@ -907,6 +1052,23 @@ class LocalVaultServer {
       const L = [`# 最近 7 天改动（${rows.length} 条）`, ''];
       for (const r of rows) L.push(`- \`${r.rel}\`　${r.sizeText}　${r.date}`);
       return { contents: [{ uri, mimeType: 'text/markdown', text: L.join('\n') }] };
+    }
+
+    if (uri === 'vault://claims') {
+      const C = require('./claims');
+      const r = C.openClaims(this.cfg, { readOnly: true });
+      if (!r.ok) {
+        return { contents: [{ uri, mimeType: 'text/markdown', text: `# 你签过的判断\n\n（${r.reason}）` }] };
+      }
+      try {
+        const sum = C.summary(r.db);
+        const every = C.listClaims(r.db, { limit: 5000 }).rows;
+        const proj = C.projectCurrent(every);
+        const text = C.renderCurrentMarkdown(proj, { signer: sum.signer }) + '\n\n' + this.claimsSummaryLine(sum);
+        return { contents: [{ uri, mimeType: 'text/markdown', text }] };
+      } finally {
+        try { r.db.close(); } catch { /* 关不掉不影响结果 */ }
+      }
     }
 
     if (uri.startsWith('vault://file/')) {

@@ -70,7 +70,7 @@ function errOut(...args) {
  *
  * 判据不该是「值长什么样」，而是「这个开关本来收不收值」。
  */
-const BOOLEAN_FLAGS = new Set(['force', 'full', 'json', 'help', 'h']);
+const BOOLEAN_FLAGS = new Set(['force', 'full', 'json', 'help', 'h', 'history', 'install-guards']);
 
 function parseArgv(argv) {
   const positional = [];
@@ -507,6 +507,63 @@ const COMMANDS = {
    */
   upstream(args) {
     return require('./lib/upstream/cli').upstreamCommand(args);
+  },
+
+  /**
+   * 判断记忆 —— 「你签过的判断」。
+   *
+   * 写它的是 App 的「提炼」页；这里只读，外加一个 `--install-guards`
+   * 用来把「只可追加」的触发器装到数据库层。
+   */
+  claims(args) {
+    const C = require('./lib/claims');
+    const { loadConfig } = require('./lib/config');
+    const cfg = loadConfig();
+    const flags = args.flags || {};
+
+    if (flags['install-guards']) {
+      const r = C.openClaims(cfg, { create: false });
+      if (!r.ok) {
+        errOut(r.reason);
+        return 1;
+      }
+      try {
+        r.db.exec(C.APPEND_ONLY_TRIGGERS);
+        out('已在判断记忆库上装好「只可追加」触发器（UPDATE / DELETE 会被数据库拒绝）。');
+        out('这一步只加约束，不改任何已有条陈。');
+        return 0;
+      } finally { try { r.db.close(); } catch { /* 无关紧要 */ } }
+    }
+
+    const r = C.openClaims(cfg, { readOnly: true });
+    if (!r.ok) {
+      errOut(r.reason);
+      return 0;   // 「还没签过任何判断」不是错误
+    }
+    try {
+      const s = C.summary(r.db);
+      if (flags.json) {
+        const every = C.listClaims(r.db, { limit: 5000 }).rows;
+        const current = [...C.projectCurrent(every).values()];
+        out(JSON.stringify({ summary: s, current }, null, 2));
+        return 0;
+      }
+      if (flags.history) {
+        const list = C.listClaims(r.db, { limit: flags.limit ? Number(flags.limit) : 500 });
+        out(C.renderHistoryMarkdown(list.rows, list.total, list.shown));
+        return 0;
+      }
+      const every = C.listClaims(r.db, {
+        limit: 5000,
+        target: args.positional[0] || undefined,
+      }).rows;
+      const current = C.projectCurrent(every);
+      out(C.renderCurrentMarkdown(current, { signer: s.signer, limit: flags.limit ? Number(flags.limit) : 200 }));
+      out('');
+      out(`事件流共 ${s.eventCount} 条 · 当前 ${s.currentTargets} 个目标 · 机器备注 ${s.machineNotes} 条（L0 待签）`);
+      if (s.retractedTargets) out(`已撤回 ${s.retractedTargets} 个目标（撤回不删行，历史里看得到）`);
+      return 0;
+    } finally { try { r.db.close(); } catch { /* 无关紧要 */ } }
   },
 };
 
