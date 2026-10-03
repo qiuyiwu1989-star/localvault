@@ -44,6 +44,28 @@ App 的「提炼」页一直在往 `~/.localvault/claims.db` 写判断，
 > 写一条做不到的验收标准比没有标准更糟：它会让「没验」看起来像「验过了」。
 > 已改成「gone 行里没有误伤」，那条能真正断言。
 
+### 改：三个「安静的错数字」（5.1）
+
+三个坑形状一样：**工具返回了一个会被当成事实的错数字，而且没有任何迹象。**
+
+**`find_files` 现在报真总数。**
+`searchFiles` 原来根本没有 `total` 字段，只有 `returned` ——
+于是「返回 5 条」读起来就是「命中 5 条」。真库实测查「项目」：`total = 1145`，`returned = 5`。
+
+**`list_directory` 现在是真列目录。**
+原来做的是 `path LIKE '目录/%'`，把**整棵子树平铺**成一张长表：
+浅目录看着正常，深目录差几千行。现在默认 `depth: 1` 只给直接子项（子目录 + 文件，像 `ls`），
+子目录带 `fileCount` / `bytes`（整棵子树合计），新增 `dirs_only`。
+另加 `totalDescendantFiles` —— 整棵子树的文件数，**不随 `depth`/`limit` 变**。
+
+**`read_text` 的 `format: json` 给原样正文。**
+原来只有带行号的版本（`  12| 原文`），拿它解析 JSON / YAML / 代码必然失败，
+而且那个前缀看起来像文件本来就有那些字符。现在 markdown 仍带行号（给人引用行方便），
+json 给不掺前缀的正文，行号改用字段给。
+`find_files` / `find_project` / `list_directory` / `recent_changes` 一并补上 `format: json`。
+
+**顺带**：`read_text` 超限报错说「请提高 maxBytes」，而 schema 里叫 `max_bytes` —— 会让人写错参数名。已统一。
+
 ---
 
 ## 1.1.1 — 2026-10-02

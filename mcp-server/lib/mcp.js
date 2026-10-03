@@ -129,6 +129,7 @@ const TOOLS = [
         max_size: { type: 'number', description: '最大体积（字节）。' },
         sort: { type: 'string', enum: ['relevance', 'recent', 'oldest', 'size', 'name'], description: '默认 relevance（无 query 时默认 recent）。' },
         limit: { type: 'number', description: '返回条数，默认 20，上限 200。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown；json 给程序用（不带给人看的排版与行号前缀）。' },
       },
       additionalProperties: false,
     },
@@ -142,6 +143,7 @@ const TOOLS = [
       properties: {
         query: { type: 'string', description: '项目名 / 域名 / 仓库名 / P 编号 / 任意关键词。' },
         limit: { type: 'number', description: '返回候选数，默认 8。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown；json 给程序用（不带给人看的排版与行号前缀）。' },
       },
       required: ['query'],
       additionalProperties: false,
@@ -150,7 +152,7 @@ const TOOLS = [
   {
     name: 'read_text',
     description:
-      '读取索引内任意文本文件的正文（带行号）。密钥类文件被规则排除，不会返回正文。不在索引里的文件也会现场读取，但必须位于已配置的索引根内。',
+      '读取索引内任意文本文件的正文。默认带行号（方便引用某行）；format=json 时给**原样正文**，不掺行号前缀。密钥类文件被规则排除，不返回正文。不在索引里的文件也会现场读取，但必须位于已配置的索引根内。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -158,6 +160,7 @@ const TOOLS = [
         start_line: { type: 'number', description: '起始行，默认 1。' },
         max_lines: { type: 'number', description: '最多返回行数，默认 400，上限 5000。' },
         max_bytes: { type: 'number', description: '索引外文件的最大读取字节，默认 200000。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown；json 给程序用（不带给人看的排版与行号前缀）。' },
       },
       required: ['path'],
       additionalProperties: false,
@@ -165,12 +168,15 @@ const TOOLS = [
   },
   {
     name: 'list_directory',
-    description: '列出某个目录下的文件条目（来自索引），用于导航、盘点与「这个目录里都有什么」。',
+    description: '列一个目录：默认只给**直接子项**（子目录 + 文件，像 ls），子目录带子孙文件数与占用。用 depth 往深里看。',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '绝对路径，或相对于工作区根的路径。' },
         limit: { type: 'number', description: '最多返回条数，默认 200。' },
+        depth: { type: 'number', description: '展开几层，默认 1（只看直接子项，像 ls）。上限 6。' },
+        dirs_only: { type: 'boolean', description: '只看子目录，不列文件。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown；json 给程序用（不带给人看的排版与行号前缀）。' },
       },
       required: ['path'],
       additionalProperties: false,
@@ -188,6 +194,7 @@ const TOOLS = [
         kind: { type: 'string', description: '类型过滤。' },
         limit: { type: 'number', description: '明细条数，默认 40，上限 200。' },
         group_by: { type: 'string', enum: ['topdir', 'none'], description: '默认按工作区顶层目录聚合。' },
+        format: { type: 'string', enum: ['markdown', 'json'], description: '默认 markdown；json 给程序用（不带给人看的排版与行号前缀）。' },
       },
       additionalProperties: false,
     },
@@ -714,13 +721,29 @@ class LocalVaultServer {
     });
     if (!res.ok) return { __error: res.error };
 
+    if (a.format === 'json') {
+      // 注意字段名：`searchFiles` 返回的是 `hits`，不是 `items`
+      // （`listFiles` 才是 `items`）。写错了这里会抛 TypeError，
+      // 而错误被 onToolCall 收成一句「执行失败」—— 看起来像工具坏了，
+      // 其实是我拼错了字段名。下面的测试会直接调一次 json，就是为这个。
+      return {
+        text: JSON.stringify({
+          query: a.query, total: res.total, returned: res.hits.length,
+          hasMore: res.hasMore, warnings: warns, hits: res.hits,
+        }, null, 2),
+      };
+    }
+
     const L = [];
     if (warns.length) {
       L.push('> ⚠️ **参数有问题**（已按默认值继续，结果可能不是你要的）：');
       for (const w of warns) L.push(`> - ${w}`);
       L.push('');
     }
-    L.push(`检索「${res.query || '(空，按时间列出)'}」：返回 ${res.returned} 条${res.hasMore ? '（还有更多，可提高 limit 或缩小范围）' : ''}，用时 ${res.tookMs}ms。`);
+    // 总数与「这次返回了几条」必须分开说，否则很容易被当成同一件事。
+    const tot = res.total == null ? null : Number(res.total);
+    const more = tot == null ? '' : `（共 ${tot} 条，这里显示 ${res.returned} 条${res.hasMore ? '，还有更多' : ''}）`;
+    L.push(`检索「${res.query || '(空，按时间列出)'}」：返回 ${res.returned} 条${more || (res.hasMore ? '（还有更多，可提高 limit 或缩小范围）' : '')}，用时 ${res.tookMs}ms。`);
     L.push('');
     if (!res.hits.length) {
       L.push('没有命中。');
@@ -757,6 +780,9 @@ class LocalVaultServer {
     const { findProject } = require('./vault');
     const res = findProject(this.cfg, db, (args && args.query) || '', args && args.limit);
     if (!res.ok) return { __error: res.error };
+    if ((args && args.format) === 'json') {
+      return { text: JSON.stringify({ query: res.query, ledger: res.ledger || null, candidates: res.candidates }, null, 2) };
+    }
     const L = [];
     L.push(`反查「${res.query}」：${res.candidates.length} 个候选。`);
     if (res.ledger) {
@@ -794,8 +820,25 @@ class LocalVaultServer {
       startLine: a.start_line,
       maxLines: a.max_lines,
       maxBytes: a.max_bytes,
+      // JSON 里要的是**原样正文**：` 12| ` 这种行号前缀是给人看的，
+      // 交给程序会让每一行都被污染，拿去解析 JSON/YAML/代码必然失败。
+      numberLines: (a.format || 'markdown') !== 'json',
     });
     if (!res.ok) return { __error: res.error };
+
+    if (a.format === 'json') {
+      return {
+        text: JSON.stringify({
+          path: res.path, rel: res.rel, source: res.source, indexed: res.indexed,
+          title: res.title, size: res.size, mtime: res.mtime, date: res.date,
+          totalLines: res.totalLines, startLine: res.startLine,
+          returnedLines: res.returnedLines, hasMoreLines: res.hasMoreLines,
+          truncatedInIndex: res.truncatedInIndex,
+          content: res.content,
+        }, null, 2),
+      };
+    }
+
     const L = [];
     L.push(`文件：\`${res.rel}\``);
     L.push(`来源：${res.source === 'db' ? '索引' : '磁盘现场读取'}　共 ${res.totalLines} 行，返回第 ${res.startLine}–${res.startLine + res.returnedLines - 1} 行${res.hasMoreLines ? '（还有后续行）' : ''}`);
@@ -815,21 +858,59 @@ class LocalVaultServer {
     const a = args || {};
     const p = a.path || this.cfg.primaryRoot;
     const abs = path.isAbsolute(p) ? p : path.resolve(this.cfg.primaryRoot, p);
-    const res = listDirectory(db, abs, { limit: a.limit });
+    const depth = Math.min(Math.max(Number(a.depth) || 1, 1), 6);
+    const res = listDirectory(db, abs, {
+      limit: a.limit, depth, dirsOnly: Boolean(a.dirs_only),
+    });
+
+    if (a.format === 'json') {
+      return {
+        text: JSON.stringify({
+          dir: res.dir, depth: res.depth,
+          dirs: res.dirs, files: res.files,
+          returnedDirs: res.returnedDirs, returnedFiles: res.returnedFiles,
+          totalDescendantFiles: res.totalDescendantFiles, hasMore: res.hasMore,
+        }, null, 2),
+      };
+    }
+
     const L = [];
-    L.push(`目录：\`${res.dir}\``);
+    L.push(`目录：\`${res.dir}\`　（展开 ${depth} 层${a.dirs_only ? '，只看目录' : ''}）`);
     L.push('');
-    if (!res.items.length) {
-      L.push('索引里这个目录下没有条目（可能不存在、或只有被跳过的机器生成目录）。');
+    if (!res.returnedDirs && !res.returnedFiles) {
+      L.push('索引里这个目录下没有条目。');
+      L.push('');
+      L.push(`（可能路径不存在、里面只有被跳过的机器生成目录，或者索引还没扫到这里。`);
+      L.push(`这个目录在前缀下共有 ${res.totalDescendantFiles} 个子孙文件。）`);
       return { text: L.join('\n') };
     }
-    L.push(`返回 ${res.returned} 条${res.hasMore ? '（还有更多，提高 limit）' : ''}：`);
-    L.push('');
-    L.push('| 路径 | 类型 | 体积 | 最后改动 | 标题 |');
-    L.push('| --- | --- | ---: | --- | --- |');
-    for (const i of res.items) {
-      L.push(`| \`${i.rel}\` | ${i.kind} | ${i.sizeText} | ${i.date} | ${(i.title || '').slice(0, 60)} |`);
+
+    if (res.returnedDirs) {
+      L.push(`## 子目录（${res.returnedDirs} 个，按占用体积排）`);
+      L.push('');
+      L.push('| 目录 | 子孙文件 | 占用 |');
+      L.push('| --- | ---: | ---: |');
+      for (const d of res.dirs) {
+        L.push(`| \`${d.relDir || d.name}/\` | ${d.fileCount} | ${d.bytesText} |`);
+      }
+      L.push('');
     }
+
+    if (res.returnedFiles) {
+      L.push(`## 文件（${res.returnedFiles} 个${res.hasMore ? '，还有更多，提高 limit' : ''}）`);
+      L.push('');
+      L.push('| 路径 | 类型 | 体积 | 最后改动 | 标题 |');
+      L.push('| --- | --- | ---: | --- | --- |');
+      for (const i of res.files) {
+        L.push(`| \`${i.rel}\` | ${i.kind} | ${i.sizeText} | ${i.date} | ${(i.title || '').slice(0, 60)} |`);
+      }
+    }
+
+    L.push('');
+    // 「一共多少」必须说清楚，否则上面那一列容易被当成全部。
+    L.push(`> 这个目录整棵子树共有 ${res.totalDescendantFiles} 个文件`
+      + `（上表只列了展开 ${depth} 层以内、且不超过 limit 的部分）。`
+      + (depth === 1 ? ' 想看更深用 `depth`。' : ''));
     return { text: L.join('\n') };
   }
 
@@ -895,6 +976,17 @@ class LocalVaultServer {
       }
       L.push('');
     }
+    if (a.format === 'json') {
+      return {
+        text: JSON.stringify({
+          root: rootPath, sinceMs, total, returned: rows.length, hasMore: total > rows.length,
+          byTopDir: [...byTop.entries()].map(([dir, g]) => ({ dir, count: g.count, bytes: g.bytes }))
+            .sort((x, y) => y.count - x.count),
+          items: rows,
+        }, null, 2),
+      };
+    }
+
     L.push('## 明细');
     L.push('');
     for (const r of rows) {

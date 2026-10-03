@@ -89,10 +89,27 @@ for (let i = 0; i < 12; i++) {
 // 被策略排除的
 fs.writeFileSync(path.join(HOME, 'Desktop', '.env'), 'TOKEN=should-not-be-indexed\n');
 
+// 一棵子目录，用来测 `list_directory` 的「直接子项」语义
+fs.mkdirSync(path.join(HOME, 'Desktop', '深', '里'), { recursive: true });
+fs.writeFileSync(path.join(HOME, 'Desktop', '深', 'a.md'), `# a\n\n${PAD}`);
+fs.writeFileSync(path.join(HOME, 'Desktop', '深', '里', 'b.md'), `# b\n\n${PAD}`);
+
 // 主根（桌面）里的**全部**条目 —— 同名文件与被策略排除的 `.env` 也是索引里的一行，
 // 所以它们都该算进「共 N 条」。第一次只数了 `近*`，期望 12、实得 16，
 // 那是**断言写错了**，不是工具错了。（这类「测试自己错」要先排除，再去改产品。）
-const RECENT_TOTAL = fs.readdirSync(path.join(HOME, 'Desktop')).length;   // 12 + 3 + 1 = 16
+//
+// **必须递归数。** 原来是 `readdirSync(Desktop).length`，在「桌面下没有子目录」时
+// 恰好等于文件数；一旦加了子目录它就少了 —— 而少的那部分会看起来像工具报错了。
+// 测试自己算错，比工具算错更难发现。
+function countFilesRecursive(dir) {
+  let n = 0;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    n += e.isDirectory() ? countFilesRecursive(path.join(dir, e.name)) : 1;
+  }
+  return n;
+}
+const RECENT_TOTAL = countFilesRecursive(path.join(HOME, 'Desktop'));   // 12 + 3 + 1 + 2 = 18
+const LIST_DIR_TOTAL = RECENT_TOTAL;
 
 function runCli(args) {
   return spawnSync(process.execPath, [CLI, ...args], {
@@ -181,6 +198,107 @@ if (ci.status !== 0 || cx.status !== 0) {
     check('非法 sort 被指出', /不是可用的排序/.test(t));
     check('三条提示同时出现（不是只报第一条）',
       /不对应任何索引根/.test(t) && /看不懂/.test(t) && /不是可用的排序/.test(t));
+  }
+
+  // ── 5. list_directory：真的列目录，不是「前缀下所有文件」 ────
+  //
+  // 修前它做的是 `path LIKE '目录/%'`，把整棵子树的文件平铺成一张表。
+  // 在浅目录上看起来完全正常，在深目录上差几千行 —— 而且没有任何迹象。
+  //
+  // 这一节的关键判据是**同一个量在不同参数下必须一致**：
+  // `totalDescendantFiles` 是「整棵子树一共几个文件」，它不该随 depth/limit 变。
+  {
+    const D = path.join(HOME, 'Desktop');
+    const d1 = JSON.parse(await tool('list_directory', { path: D, depth: 1, format: 'json' }));
+    const d2 = JSON.parse(await tool('list_directory', { path: D, depth: 2, format: 'json' }));
+    const d3 = JSON.parse(await tool('list_directory', { path: D, depth: 3, format: 'json' }));
+    const dL = JSON.parse(await tool('list_directory', { path: D, depth: 3, limit: 1, format: 'json' }));
+    const dD = JSON.parse(await tool('list_directory', { path: D, depth: 1, dirs_only: true, format: 'json' }));
+
+    check('depth=1 只给直接子项：恰好 1 个子目录（修前会平铺整棵树）',
+      d1.returnedDirs === 1, `返回 ${d1.returnedDirs} 个：[${d1.dirs.map((x) => x.name).join(', ')}]`);
+    // 判据写「rel 里一个斜杠都没有」而不是「不含 /深/」。
+    //
+    // 原来写的是 `f.rel.includes('/深/')` —— 而 rel 是**相对根目录**的，
+    // 实际值是 `深/a.md`，它开头就是 `深/`，**根本不含 `/深/`**。
+    // 于是断言永远成立：把实现改回「平铺整棵树」，测试照样全绿。
+    // 这是这个测试自己的 bug，不是产品的。
+    check('depth=1 的文件全是直接子项（rel 里不该出现任何 /）',
+      d1.files.every((f) => !f.rel.includes('/')),
+      d1.files.map((f) => f.rel).filter((r) => r.includes('/')).join(', '));
+    check('depth=2 多出二级子目录「里」', d2.returnedDirs === 2,
+      `返回 ${d2.returnedDirs} 个：[${d2.dirs.map((x) => x.name).join(', ')}]`);
+    check('depth=3 才看得到最深那个文件', d3.files.some((f) => f.rel.endsWith('里/b.md')),
+      d3.files.map((f) => f.rel).join(', '));
+
+    check('子孙总数不随 depth 变（这修的正是「上限被当总数」）',
+      d1.totalDescendantFiles === d2.totalDescendantFiles && d2.totalDescendantFiles === d3.totalDescendantFiles,
+      `${d1.totalDescendantFiles} / ${d2.totalDescendantFiles} / ${d3.totalDescendantFiles}`);
+    check('子孙总数等于夹具真值',
+      d1.totalDescendantFiles === LIST_DIR_TOTAL,
+      `报 ${d1.totalDescendantFiles}，真值 ${LIST_DIR_TOTAL}`);
+    check('limit=1 时总数仍然是真总数（修前这里会变成 1）',
+      dL.totalDescendantFiles === LIST_DIR_TOTAL && dL.returnedFiles === 1,
+      `总数 ${dL.totalDescendantFiles} · 显示 ${dL.returnedFiles}`);
+    check('dirs_only 只给目录、不给文件', dD.returnedDirs === 1 && dD.returnedFiles === 0,
+      `目录 ${dD.returnedDirs} 文件 ${dD.returnedFiles}`);
+    // 这里要能扛住 `dirs` 为空 —— 反向证明时它就是空的。
+    // 不扛住的话测试会**崩**，而不是干净地报一条 ✗（崩也算失败，但看不出是哪个判据）。
+    const d0 = d1.dirs[0];
+    check('子目录带子孙文件数与占用（看得出哪个目录占地方）',
+      Boolean(d0) && d0.fileCount === 2 && typeof d0.bytesText === 'string',
+      d0 ? JSON.stringify(d0) : 'dirs 是空的（depth=1 应该至少给一个子目录）');
+
+    // markdown 里也要说清「一共多少」，否则那张表会被当成全部
+    const md = await tool('list_directory', { path: D, depth: 1 });
+    check('markdown 里明说整棵子树共有多少（不是只有表格）',
+      new RegExp(`整棵子树共有 ${LIST_DIR_TOTAL} 个文件`).test(md),
+      md.split('\n').filter((l) => l.includes('共有')).join(' / ') || '（没找到）');
+  }
+
+  // ── 6. find_files 的总数、read_text 的 JSON ──────────────────
+  {
+    // 修前 searchFiles 根本没有 total：只报 returned，于是「返回 5 条」被当成命中数。
+    const j5 = JSON.parse(await tool('find_files', { query: '正文', limit: 5, format: 'json' }));
+    const j50 = JSON.parse(await tool('find_files', { query: '正文', limit: 50, format: 'json' }));
+    check('find_files 的 json 里有 total', typeof j5.total === 'number', JSON.stringify(j5).slice(0, 200));
+    check('total 不随 limit 变（这正是「上限不是总数」）',
+      j5.total === j50.total, `limit=5 → ${j5.total}；limit=50 → ${j50.total}`);
+    check('total ≥ returned', j5.total >= j5.returned, `total=${j5.total} returned=${j5.returned}`);
+
+    const md5 = await tool('find_files', { query: '正文', limit: 5 });
+    check('markdown 里把「共 N 条」和「显示 M 条」分开说',
+      /共 \d+ 条/.test(md5) && /这里显示 5 条/.test(md5),
+      md5.split('\n')[0]);
+
+    // read_text：markdown 带行号（给人），json 给原样正文（给程序）
+    const target = path.join(HOME, 'Desktop', '深', 'a.md');
+    const mdT = await tool('read_text', { path: target });
+    const jsT = JSON.parse(await tool('read_text', { path: target, format: 'json' }));
+    check('markdown 版本带行号前缀（方便引用某行）', /^\s*1\| /m.test(mdT),
+      mdT.split('\n').find((l) => l.includes('|')) || '（没有行号）');
+    check('json 版本**不带**行号前缀（否则拿去解析必然失败）',
+      !/^\s*1\| /m.test(jsT.content),
+      JSON.stringify(jsT.content.slice(0, 80)));
+    check('json 版本的正文是原样内容', jsT.content.startsWith('# a'),
+      JSON.stringify(jsT.content.slice(0, 40)));
+    check('json 里行号信息用字段给，不掺进正文',
+      jsT.startLine === 1 && typeof jsT.totalLines === 'number' && typeof jsT.returnedLines === 'number',
+      JSON.stringify({ startLine: jsT.startLine, totalLines: jsT.totalLines, returnedLines: jsT.returnedLines }));
+
+    // 五个工具的 json 都必须是**合法 JSON**（不是「看起来像 JSON」）
+    for (const [name, args] of [
+      ['find_files', { query: '正文', format: 'json' }],
+      ['find_project', { query: '甲', format: 'json' }],
+      ['read_text', { path: target, format: 'json' }],
+      ['list_directory', { path: path.join(HOME, 'Desktop'), format: 'json' }],
+      ['recent_changes', { since: '7d', format: 'json' }],
+    ]) {
+      let ok = false; let why = '';
+      try { const v = JSON.parse(await tool(name, args)); ok = Boolean(v) && typeof v === 'object'; }
+      catch (e) { why = e.message; }
+      check(`${name} 的 format=json 输出是合法 JSON`, ok, why);
+    }
   }
 
   proc.kill('SIGKILL');

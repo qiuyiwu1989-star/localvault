@@ -175,6 +175,18 @@ function searchFiles(db, cfg, opts) {
     };
   }
 
+  // 「一共命中多少」要单独数一次。
+  //
+  // `fetchLimit` 是 LIMIT，把它的结果当成总数，就是把**上限**写成了**统计值**。
+  // 那种数字看起来完全像个事实，所以比不给更坏 —— `recent_changes` 已经踩过这个坑
+  // （limit=40 就报「命中 40 条」，真值 4,805）。这里不给它机会复发。
+  let total = null;
+  try {
+    total = Number(db.prepare(`SELECT count(*) AS c FROM files WHERE ${whereSql}`).get(...whereParams).c);
+  } catch (_e) {
+    total = null;   // 数不出来就给 null，绝不拿 returned 冒充
+  }
+
   const hasMore = rows.length > limit;
   const used = rows.slice(0, limit);
 
@@ -221,6 +233,7 @@ function searchFiles(db, cfg, opts) {
     sort,
     tookMs: Date.now() - started,
     returned: hits.length,
+    total,
     hasMore,
     hits,
   };
@@ -335,32 +348,126 @@ function listFiles(db, opts) {
 }
 
 /** 目录列表（治理与导航用）。 */
+/**
+ * 列一个目录。
+ *
+ * **这是一次真正的目录列表，不是「路径前缀下的所有文件」。**
+ *
+ * 原来它做的是 `path LIKE '目录/%'` —— 于是列一个顶层目录会把它下面
+ * **全部子孙文件**平铺成一张长表。而「这个目录里有什么」问的是**直接子项**。
+ * 两者在浅目录上看起来一模一样，在深目录上差几千行 —— 那种差别不会报错，
+ * 只会让人以为「这个目录里有 4000 个文件」。
+ *
+ * `depth` 控制展开几层：
+ * - `depth: 1`（默认）= 直接子目录 + 直接子文件，像 `ls`；
+ * - `depth: n` = 展开到第 n 层，中间层以目录聚合出现。
+ *
+ * 子目录带 `fileCount` / `bytes`（该目录**整棵子树**的合计），
+ * 这样「哪个目录占地方」不用再猜。
+ */
 function listDirectory(db, dirAbsPosix, opts) {
   const o = opts || {};
   const limit = Math.min(Math.max(Number(o.limit) || 200, 1), 1000);
+  const depth = Math.min(Math.max(Number(o.depth) || 1, 1), 6);
   const prefix = String(dirAbsPosix).replace(/\/+$/, '');
+  const base = prefix + '/';
+
+  // 一次取回前缀下的全部行，再在内存里按层级切。
+  //
+  // 为什么不用 SQL 数斜杠：`length(rel) - length(replace(rel,'/',''))` 这类算式
+  // 一长，读的人就只能靠猜，而算错一位不会报错 —— 只会少给或多给几行。
+  // 这里行数本来就有界（一个目录的子孙），内存切分更看得懂。
   const rows = db
     .prepare(
-      `SELECT rel, name, ext, kind, size, mtime, title FROM files
+      `SELECT path, rel, name, ext, kind, size, mtime, title FROM files
        WHERE gone = 0 AND is_symlink = 0 AND path LIKE ? ESCAPE '\\'
-       ORDER BY rel ASC LIMIT ?`,
+       ORDER BY path ASC`,
     )
-    .all(escapeLike(prefix) + '/%', limit + 1);
-  const hasMore = rows.length > limit;
-  const items = rows.slice(0, limit).map((r) => {
-    const rel = toPosix(r.rel);
-    return {
-      rel,
-      name: r.name,
-      kind: r.kind,
-      size: Number(r.size),
-      sizeText: formatBytes(Number(r.size)),
-      mtime: Number(r.mtime),
-      date: formatDate(Number(r.mtime)),
-      title: squeeze(r.title),
-    };
+    .all(escapeLike(prefix) + '/%');
+
+  const mkItem = (r) => ({
+    rel: toPosix(r.rel),
+    name: r.name,
+    kind: r.kind,
+    size: Number(r.size),
+    sizeText: formatBytes(Number(r.size)),
+    mtime: Number(r.mtime),
+    date: formatDate(Number(r.mtime)),
+    title: squeeze(r.title),
   });
-  return { dir: prefix, returned: items.length, hasMore, items };
+
+  const dirs = new Map();   // 直接/浅层子目录 → 聚合
+  const files = [];
+  let totalFiles = 0;       // 前缀下**全部**子孙文件数（用于「还有多少没列」）
+  let capped = false;       // 文件条数到了 limit
+
+  for (const r of rows) {
+    const full = toPosix(r.path);
+    if (!full.startsWith(base)) continue;
+    const rest = full.slice(base.length);
+    if (!rest) continue;
+    totalFiles += 1;
+
+    const parts = rest.split('/');
+    if (parts.length > 1) {
+      // 落在子目录里：把前 depth-1 层的目录名都登记上
+      // 展开到 depth 层：depth=1 时也要看得出「有个子目录」，
+      // 否则 ls 一个目录会连子目录都看不到 —— 那正是最该看见的东西。
+      const upto = Math.min(parts.length - 1, depth);
+      for (let i = 1; i <= upto; i += 1) {
+        const relDir = base + parts.slice(0, i).join('/');
+        let e = dirs.get(relDir);
+        if (!e) {
+          // `relDir` 是**相对被列目录**的路径。
+          // 只给 `name` 的话，depth≥2 时会出现一堆裸名字（`里`、`src`），
+          // 根本看不出它是谁的下级 —— 那等于没列。
+          e = {
+            rel: relDir,
+            name: parts[i - 1],
+            relDir: parts.slice(0, i).join('/'),
+            level: i,
+            fileCount: 0,
+            bytes: 0,
+          };
+          dirs.set(relDir, e);
+        }
+        e.fileCount += 1;
+        e.bytes += Number(r.size);
+      }
+    }
+
+    // 只有层级 ≤ depth 的文件才算「列出来了」。
+    // depth=1 时这一条对子目录里的文件永远不成立 —— 正是我们要的。
+    if (parts.length - 1 < depth && !o.dirsOnly) {
+      if (files.length < limit) files.push(mkItem(r));
+      else capped = true;
+    }
+  }
+
+  for (const e of dirs.values()) {
+    e.bytesText = formatBytes(e.bytes);
+  }
+
+  const dirList = [...dirs.values()].filter((d) => d.level <= depth)
+    .sort((a, b) => b.bytes - a.bytes);
+  files.sort((a, b) => b.mtime - a.mtime);
+
+  return {
+    dir: prefix,
+    depth,
+    // 直接子目录数（像 ls 里那几个名字）
+    returnedDirs: dirList.length,
+    returnedFiles: files.length,
+    // 前缀下**全部**子孙文件，不受 limit 影响 —— 用来回答「这个目录一共多大」
+    totalDescendantFiles: totalFiles,
+    hasMore: capped,
+    dirs: dirList,
+    files,
+    // 兼容旧调用方：原来是「前缀下前 limit 个文件」
+    items: files,
+    returned: files.length,
+    hasMoreFiles: capped,
+  };
 }
 
 /**

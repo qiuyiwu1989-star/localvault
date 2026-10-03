@@ -653,7 +653,7 @@ function readTextFile(cfg, db, targetPath, opts) {
       return {
         ok: false,
         path: toPosix(abs),
-        error: `文件 ${formatBytes(st.size)} 超过单次读取上限 ${formatBytes(maxBytes)}；请提高 maxBytes 或改用其他方式。`,
+        error: `文件 ${formatBytes(st.size)} 超过单次读取上限 ${formatBytes(maxBytes)}；请提高 max_bytes（或改用 start_line 分段读）。`,
       };
     }
     try {
@@ -671,9 +671,14 @@ function readTextFile(cfg, db, targetPath, opts) {
   const lines = body.split('\n');
   const slice = lines.slice(startLine - 1, startLine - 1 + maxLines);
   const width = String(startLine + slice.length - 1).length;
-  const numbered = slice
-    .map((l, i) => `${String(startLine + i).padStart(width, ' ')}| ${l}`)
-    .join('\n');
+  // `numberLines: false` 时给**原样正文**。
+  // 行号前缀是给人看的（助手读起来方便对行引用）；
+  // 但把它交给程序用就错了 —— 每一行都被污染成 ` 12| 原文`，
+  // 拿去解析（JSON/YAML/代码）必然失败，而且看起来像是文件本身的内容。
+  const raw = slice.join('\n');
+  const numbered = o.numberLines === false
+    ? raw
+    : slice.map((l, i) => `${String(startLine + i).padStart(width, ' ')}| ${l}`).join('\n');
 
   return {
     ok: true,
@@ -691,6 +696,7 @@ function readTextFile(cfg, db, targetPath, opts) {
     returnedLines: slice.length,
     hasMoreLines: startLine - 1 + slice.length < lines.length,
     content: numbered,
+    rawText: raw,
   };
 }
 

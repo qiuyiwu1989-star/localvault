@@ -268,10 +268,10 @@ App 是 SwiftUI 前端，读索引库时以只读模式打开；只有首次运�
 | --- | --- |
 | `vault_map` | 完整地图：索引范围、入口文档、目录用途、台账、类型分布、规则摘要 |
 | `disk_coverage` | 覆盖度：暗区按代价分层（白捡 / 格式解析 / OCR / 转录 / 不必变亮） |
-| `find_files` | 子串检索文件名/路径/标题/各级标题/正文，可按类型、时间、体积过滤 |
+| `find_files` | 子串检索文件名/路径/标题/各级标题/正文，可按类型、时间、体积过滤。**报出真总数**，不拿 limit 冒充 |
 | `find_project` | 项目名/域名/仓库名/编号反查台账条目、卡片与资料目录 |
-| `read_text` | 读索引内文本文件正文（带行号与上限） |
-| `list_directory` | 列目录条目 |
+| `read_text` | 读索引内文本文件正文。默认带行号；`format: json` 给原样正文（不掺行号前缀） |
+| `list_directory` | 列一个目录：默认只给**直接子项**（子目录 + 文件，像 `ls`），子目录带子孙文件数与占用；`depth` 往深看，`dirs_only` 只看目录 |
 | `recent_changes` | 最近改动（默认 7 天），按顶层目录聚合 |
 | `vault_audit` | 六项只读体检：duplicates / stale / naming / inbox / root_clutter / links |
 | `propose_organize` | 整理方案（dry-run，不动文件） |
