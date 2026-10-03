@@ -71,6 +71,21 @@ jobs:
             exit 1
           fi
 
+      - name: 确认 npm 没有偷偷改我们的发布清单
+        # `npm test` 里已经有一条同名检查，这里**再挡一次**是故意的：
+        # 测试可能被人从链子上摘掉，而这一条在发布这条路径上，摘不掉。
+        working-directory: mcp-server
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          OUT="$(npm publish --dry-run --access public 2>&1 || true)"
+          echo "$OUT"
+          if echo "$OUT" | grep -qi 'auto-corrected\|was invalid and removed'; then
+            echo "::error::npm 改动了我们的发布清单，上面 warn publish 那几行就是它改了什么。"
+            echo "改到 bin 上意味着包发出去后**装完没有任何命令**。先修 package.json 再发。"
+            exit 1
+          fi
+
       - name: 干跑（不发布）
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         env:

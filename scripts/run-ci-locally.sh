@@ -81,11 +81,20 @@ step "CI 配置文件本身（语法 + 会不会被触发）" check_workflow
 
 step "恒真断言扫描" python3 "$HERE/check-assertions.py"
 
-# 测试直接跑 node —— 本地没有 npm（CI 上有）。测试内容完全一样。
+# 如果本机装了 Node/npm（例如便携装的 ~/.localvault-toolchain），把它加进 PATH。
+#
+# 为什么：`package-integrity` 里有一条**真跑 `npm publish --dry-run`** 的检查。
+# 没有 npm 时它会明确报「跳过」，而跳过不等于通过。让它在本地也真的跑，
+# 才不会出现「本地全绿、CI 才发现」——这个差异今天已经咬过我一次了。
+for _d in "$HOME"/.localvault-toolchain/node-*/bin; do
+  [ -x "$_d/npm" ] && PATH="$_d:$PATH" && export PATH
+done
+
+# 测试直接跑 node —— 测试内容与 CI 完全一样。
 # 加新测试时**这里和 package.json 的 test 脚本都要加**，两处必须一致。
 run_tests() {
   local d="$REPO/mcp-server"
-  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network scan-integrity; do
+  for t in ignore-lists smoke clean-machine upstream mcp-handshake cli-args tool-honesty no-network scan-integrity package-integrity; do
     printf '   %-15s ' "$t"
     if (cd "$d" && "$NODE" "test/$t.js" >/tmp/ci-$t.log 2>&1); then
       grep -E "^通过|通过 [0-9]+ 项" /tmp/ci-$t.log | tail -1
