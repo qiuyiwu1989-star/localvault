@@ -763,10 +763,20 @@ struct SearchView: View {
         guard !q.isEmpty else { return }
         searching = true
         let dbPath = vault.dbPath
-        var f = VaultQuery.SearchFilter()
-        if let k = kindFilter { f.kinds = [k] }
-        f.sinceDays = sinceDays
-        f.topDir = dirFilter
+        // 必须在进 `Task.detached` 之前拼成一个**不可变**的 let。
+        //
+        // 原来这里是 `var f`，然后在并发闭包里读它 —— Swift 5.10（GitHub 的
+        // macos-14 runner 就是它）直接**报错**：
+        //   error: reference to captured var 'f' in concurrently-executing code
+        // 而本机的 Swift 6.3.3 只给警告（tools-version 5.9 = Swift 5 语言模式），
+        // 于是本地全绿、CI 红。这个差异不是「谁更对」，是**本地检查不了 CI 的严格度**。
+        let f: VaultQuery.SearchFilter = {
+            var f = VaultQuery.SearchFilter()
+            if let k = kindFilter { f.kinds = [k] }
+            f.sinceDays = sinceDays
+            f.topDir = dirFilter
+            return f
+        }()
 
         Task {
             let t0 = Date()

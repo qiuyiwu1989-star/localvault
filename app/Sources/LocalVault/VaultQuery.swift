@@ -188,7 +188,9 @@ enum VaultQuery {
     }
 
     /// 检索的筛选条件
-    struct SearchFilter {
+    // 显式 Sendable：成员全是值类型（Set<String> / String? / Int?），
+    // 它要跨进 `Task.detached`。写明比依赖推断好 —— 推断不会在测试里留证据。
+    struct SearchFilter: Sendable {
         var kinds: Set<String> = []          // 空 = 不限
         var topDir: String? = nil            // nil = 不限
         var sinceDays: Int? = nil            // nil = 不限

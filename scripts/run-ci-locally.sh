@@ -85,7 +85,30 @@ run_tests() {
 }
 step "全部测试" run_tests
 
-step "Swift 编译（Release）" bash -c "cd '$REPO/app' && swift build -c release"
+# Swift 编译 —— **必须从零编**。
+#
+# 为什么：`swift build` 是增量的。改了一个文件，它只重编那个文件和依赖它的部分。
+# 于是「本地编译通过」可能只意味着「我改的那几个文件编过了」，**其余文件根本没被看过**。
+# 实测吃过这个亏：`SearchView.swift` 里的一个捕获 var 在 CI 上直接报错，
+# 而本地一路绿灯 —— 因为那次我改的是 `VaultIndexer.swift`，`SearchView.swift` 压根没重编。
+swift_step() {
+  cd "$REPO/app" || return 1
+  printf '   Swift: %s\n' "$(swift --version 2>&1 | sed -n 's/^Apple Swift version \([^ ]*\).*/\1/p')"
+  rm -rf .build
+  swift build -c release
+}
+step "Swift 编译（Release，从零）" swift_step
+
+# ⚠️ 必须知道的一件事：**本机的 Swift 比 CI 的宽松，本地绿不等于 CI 绿。**
+#
+# 实测：本机 Swift 6.3.3，GitHub 的 macos-14 runner 是 Swift 5.10。
+# 同一个「在并发闭包里捕获 var 再读」的写法，5.10 直接报错、6.3.3 只给警告
+# （tools-version 5.9 走 Swift 5 语言模式）。仓库公开后 CI 会在每次 push 时真跑，
+# **那才是严格度的那道门**；本地这一步只能保证「不是缓存骗了我」。
+step "提醒：本地 Swift 与 CI 的版本差异" bash -c '
+  printf "   本机 Swift 版本（见上）；CI 用 macos-14 → Swift 5.10。\n"
+  printf "   两者严格度不同：本地绿 **不**代表 CI 绿。以 push 后的 CI 为准。\n"
+' 
 
 # 跨索引器对拍：同一棵语料树，CLI 和 App 各建一次索引，逐字段比。
 #
