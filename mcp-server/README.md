@@ -83,7 +83,7 @@ node /绝对路径/node_modules/localvault/server.js
 1. **`initialize` 返回的 `instructions`** —— 一开工就进系统提示词的「本机地图」（索引范围、权威入口文档、
    目录用途、项目台账、你写的文件管理规则摘要）。内容是**从本机文件系统实时生成**的，不是手写的。
    它有长度上限（默认 32768 字节，代码内保守截到 24000），超了会按行截断并明确标注被截断。
-2. **10 个只读工具 + 5 个资源**（见下）。
+2. **11 个只读工具 + 1 个只追加 + 5 个资源**（见下）。
 
 ---
 
@@ -106,6 +106,8 @@ node /绝对路径/node_modules/localvault/server.js
 | `coverage` | 覆盖度报告：暗区按「变亮要付什么代价」分层 |
 | `doctor` | 自检：配置、索引、instructions 字节数等是否正常 |
 | `ledger` | 台账相关操作 |
+| `upstream` | 对接上游记忆中心的只读桥（需显式启用，默认不动） |
+| `claims [目标] [--history] [--json]` | 读「你签过的判断」。`--install-guards` 装上「只可追加」触发器 |
 | `help` | 列出全部命令（`--help` / `-h` 同效） |
 
 不带任何参数时也打印这份命令清单。另有 `package.json` 的 `scripts` 别名
@@ -113,7 +115,7 @@ node /绝对路径/node_modules/localvault/server.js
 
 ---
 
-## MCP 工具清单（10 个，全部只读）
+## MCP 工具清单（12 个：11 个只读 + 1 个只追加）
 
 工具名来自 `lib/mcp.js` 的工具注册表。在 DSH 里前缀是 `mcp__localvault__`。
 
@@ -129,8 +131,13 @@ node /绝对路径/node_modules/localvault/server.js
 | `vault_audit` | 只读治理体检：`duplicates` / `stale` / `naming` / `inbox` / `root_clutter` / `links` |
 | `propose_organize` | 按你的文件管理规则生成整理方案（**dry-run，只出报告**） |
 | `refresh_index` | 索引过期或刚改过文件后重建（增量；默认后台跑，完成后再查） |
+| `read_claims` | 读「你签过的判断」：当前状态，或 `history=true` 看完整事件流 |
+| `triage` | 列待处理项，并把结论**追加**进判断记忆（L0 待签）。唯一会写东西的工具 |
 
-同时提供 4 个登记在册的资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`，
+前 11 个**不写任何东西**。第 12 个 `triage` 只能**往判断记忆里追加**一条机器条陈
+（L0 待签）—— 不能改、不能删、不能替人签判断。数据库层有触发器兜底。
+
+同时提供 5 个登记在册的资源：`vault://map`、`vault://guide`、`vault://projects`、`vault://recent`、`vault://claims`，
 资源模板 `vault://file/{path}`，以及一个**未登记但可用**的别名 **`vault://overview`**
 （与 `vault://map` 走同一个 handler，返回完全相同的内容；它不出现在 `resources/list` 里，
 所以列表里看不到，但可以直接读）。

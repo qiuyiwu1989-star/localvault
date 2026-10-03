@@ -16,6 +16,17 @@ name: 发布到 npm
 #     先落一个 `0.0.0-stage` 占位版本）
 #   - 需要 npm CLI ≥11.15.0、Node ≥22.14
 #
+# ⚠️ **但文档这条对本项目不成立 —— 实测过，记在这里省得下次重踩：**
+#
+#     400 Bad Request - POST https://registry.npmjs.org/-/stage/package/localvault
+#         Version uniqueness check failed unexpectedly.
+#
+#   本机（npm 11.19.0）和 CI 上都是这个结果，带不带 provenance 都一样。
+#   服务端在「包还不存在」时做版本唯一性检查就撞了空 —— 这是 npm 侧的缺陷。
+#   所以 stage 这条路对**全新包名**走不通；名字发出去之后应该就好了。
+#
+#   结论：**首次发布只能人工**（npm login + 输 OTP）。见 README「怎么把它发到 npm」。
+#
 # 于是令牌只够「提交」，不够「上线」。**上线必须有人在 npmjs.com 上
 # 用 2FA 点一次 Approve。** 一道自动流水线上，这一步人为确认不是麻烦，
 # 是它唯一的价值所在 —— 尤其对一个要往 npm 写公开包的工具。

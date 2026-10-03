@@ -26,7 +26,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node test/ignore-lists.js && node test/smoke.js && node test/clean-machine.js && node test/upstream.js && node test/mcp-handshake.js && node test/cli-args.js && node test/tool-honesty.js && node test/no-network.js && node test/scan-integrity.js && node test/package-integrity.js && node test/claims.js",
+    "test": "node test/ignore-lists.js && node test/smoke.js && node test/clean-machine.js && node test/upstream.js && node test/mcp-handshake.js && node test/cli-args.js && node test/tool-honesty.js && node test/no-network.js && node test/scan-integrity.js && node test/package-integrity.js && node test/claims.js && node test/doc-consistency.js",
     "index": "node cli.js index",
     "map": "node cli.js map",
     "doctor": "node cli.js doctor",

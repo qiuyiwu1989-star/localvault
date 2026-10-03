@@ -28,7 +28,7 @@
 三条，对应真实存在的命令与工具，不是方向性描述。
 
 **1. 让 agent 查得到你的文件。**
-建好索引后，agent 通过 10 个只读 MCP 工具检索文件名、路径、文档标题、各级标题和正文
+建好索引后，agent 通过 11 个只读 MCP 工具（另有 1 个只能追加判断记忆）检索文件名、路径、文档标题、各级标题和正文
 （中文按子串匹配，2 个字就能命中），并能直接读正文。连上时还会自动注入一段「本机地图」：
 索引了哪些根、权威入口文档、顶层目录用途、台账概况、你自己规则文档里的规则原文。
 
@@ -138,7 +138,7 @@ $ curl -s -o /dev/null -w '%{http_code}\n' https://registry.npmmirror.com/localv
 ## 接进 agent（MCP）
 
 localvault 是一个标准 **stdio MCP server**，服务器名 `localvault`，入口是 `mcp-server/server.js`。
-接上以后，agent 会多出 `mcp__localvault__*` 前缀的 10 个只读工具（清单见下），
+接上以后，agent 会多出 `mcp__localvault__*` 前缀的 11 个只读工具（另有 1 个只追加）（清单见下），
 并且 `initialize` 返回的 `instructions`（本机地图，默认上限 32768 字节）会成为系统提示词的一部分 ——
 「什么时候该去查本地上下文」不用你每次提醒。DSH 用户可以直接跑
 `node cli.js setup-dsh` 生成本机挂载补丁；其他客户端手工配 stdio 命令即可。
@@ -192,7 +192,7 @@ CLI 是 Node，跨平台。图形界面是 SwiftUI、macOS 14+ 专用，没有 L
   `LOCALVAULT_MEMORY_TOKEN` 已设置（只从环境读，代码里没有任何地方能传 Token 参数），
   并且你手敲了这两个子命令。没设 Token 时一个请求都不发：这条有测试守着
   （`node test/no-network.js`，26 条断言，把 `globalThis.fetch` 换成会记账的守卫来证明 0 是真的）。
-  索引、检索、体检、10 个 MCP 工具全程本机。
+  索引、检索、体检、12 个 MCP 工具全程本机。
 - **不做 LLM 提炼。** 没有摘要、没有结论生成、不调用任何模型。
 - **不做语义检索。** 检索是子串匹配，不是向量检索。搜「我当年怎么开始创业的」这类意图查询会落空；
   向量检索有价值，但它的代价（常驻服务 + 向量模型）不是这一层该背的。
@@ -340,6 +340,45 @@ node test/no-network.js         # 没配 Token 时零网络请求（把 fetch �
 - **mtime 会被设备迁移污染**：`stale` 检查基于 mtime，迁移过的盘上会失真。
 - **正文上限**：单文件抽取上限 2MB，入库正文上限 400,000 字符，超出截断并标注。
 - **重名文件**：以绝对路径为唯一键，同名不同目录是两条记录（有意的；体检会另外报同名簇）。
+
+## 怎么把它发到 npm（维护者看）
+
+**首次发布必须人工，自动化发不了** —— 这不是没配好，是 npm 的规则。实测记录：
+
+```
+$ npm publish --access public
+403 Two-factor authentication or granular access token with bypass 2fa
+    enabled is required to publish packages.
+```
+
+npm 的报错把要求写得很直白：账号开了 2FA（auth-and-writes）时，
+发布要么带一次 6 位 OTP，要么用一个**勾了 Bypass two-factor authentication** 的
+granular token。走 token 时连 `--otp=xxxxxx` 也不管用（npm 根本不会去验证它）。
+
+`npm stage publish` 是 npm 为这种场景给的出路，官方文档说它**不需要 2FA**、
+**支持新包** —— 但对一个全新包名，服务端实测返回：
+
+```
+400 Bad Request - POST https://registry.npmjs.org/-/stage/package/<名字>
+    Version uniqueness check failed unexpectedly.
+```
+
+本机（npm 11.19.0）和 CI 上都是这个结果，带不带 provenance 都一样。
+服务端在包还不存在时做版本唯一性检查撞了空。所以这条路对**全新包名**走不通。
+
+于是顺序是：
+
+1. **人工发一次**（`npm login` → `npm publish --access public` → 输 OTP）。
+   发完 `npm view <包名> version bin` 验一下 —— `bin` 必须存在，
+   否则别人装上以后没有任何命令。
+2. 包存在之后，去 npmjs.com → 该包 → Settings → **Trusted publishing**，
+   填仓库与 workflow 文件名（本项目是 `publish.yml`）。
+3. 配好 OIDC 就把仓库里的 `NPM_TOKEN` secret **删掉** —— 之后再不需要任何令牌。
+
+> 顺带一个给自己人看的教训：写发布脚本时，
+> `if ! npm test | tail -2; then 中止; fi` 这句**永远不会中止** ——
+> 管道的退出码是 `tail` 的，恒为 0。测试全红它照样往下发布，
+> 而且它是一句**打印出来的保证**。要取被测命令自己的退出码，必须单独存。
 
 ## 待补与未实测（别当成事实）
 
