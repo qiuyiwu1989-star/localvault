@@ -51,19 +51,31 @@ step() {
 # 而界面上一切照旧，看起来像「CI 是绿的」。文件本身出错，比某条测试失败更隐蔽。
 # 所以这一条排在最前面：它要是红的，后面跑得再绿也不算数。
 check_workflow() {
-  local f="$REPO/.github/workflows/ci.yml"
-  [ -f "$f" ] || { echo "没有 .github/workflows/ci.yml —— 公开仓库上不会有 CI"; return 1; }
-  ruby -ryaml -e '
-    d = YAML.load_file(ARGV[0])
-    raise "缺少 on（那它就不会被触发）" unless d["on"] || d[true]
-    raise "缺少 jobs" unless d["jobs"].is_a?(Hash) && !d["jobs"].empty?
-    d["jobs"].each do |n, j|
-      raise "#{n} 缺 runs-on" unless j["runs-on"]
-      raise "#{n} 没有 steps" unless j["steps"].is_a?(Array) && !j["steps"].empty?
-    end
-    on = d["on"] || d[true]
-    puts "  workflow 有效：触发=#{on.keys.join(",")} · job=#{d["jobs"].keys.join(",")}"
-  ' "$f"
+  # 验**每一个** workflow 文件，不是只验 ci.yml。
+  #
+  # 原来写死了 ci.yml —— 于是后来加的 publish.yml 就算坏了本地也发现不了，
+  # 要等推上去、GitHub 拒绝、或者发布那一步才炸。
+  # 「检查只覆盖了我恰好想起来的那个文件」，等于没有检查。
+  local dir="$REPO/.github/workflows" n=0
+  [ -d "$dir" ] || { echo "没有 .github/workflows/ —— 公开仓库上不会有 CI"; return 1; }
+  for f in "$dir"/*.yml "$dir"/*.yaml; do
+    [ -f "$f" ] || continue
+    n=$((n + 1))
+    printf '   %-14s ' "$(basename "$f")"
+    ruby -ryaml -e '
+      d = YAML.load_file(ARGV[0])
+      raise "缺少 on（那它就不会被触发）" unless d["on"] || d[true]
+      raise "缺少 jobs" unless d["jobs"].is_a?(Hash) && !d["jobs"].empty?
+      d["jobs"].each do |name, j|
+        raise "#{name} 缺 runs-on" unless j["runs-on"]
+        raise "#{name} 没有 steps" unless j["steps"].is_a?(Array) && !j["steps"].empty?
+      end
+      on = d["on"] || d[true]
+      onk = on.is_a?(Hash) ? on.keys.join(",") : on.to_s
+      puts "触发=#{onk} · job=#{d["jobs"].keys.join(",")}"
+    ' "$f" || return 1
+  done
+  [ "$n" -gt 0 ] || { echo "workflows 目录里没有任何 yml"; return 1; }
 }
 step "CI 配置文件本身（语法 + 会不会被触发）" check_workflow
 
