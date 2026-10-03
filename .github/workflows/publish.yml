@@ -1,35 +1,48 @@
 name: 发布到 npm
 
-# 为什么把发布放在 CI 里，而不是「谁在本地跑一条 npm publish」：
+# ── 为什么是「提交待审」，而不是直接发布 ────────────────────────────
 #
-# 发布令牌是一个**能代表你身份写公开包**的凭据。放在 GitHub 的
-# repository secret 里，它只在这一条 workflow 的一次运行中、以环境变量的形式
-# 存在几十秒；不落盘、不进对话记录、不进 shell 历史、不用发给任何人。
+# npm 在 2026-07 收紧了凭据：带 bypass-2FA 的 granular token 不能再用来自动
+# 直接发布（2027-01 起彻底失效，官方让你改用 trusted publishing 或 staged）。
+# 实测直接发布会被挡回来：
 #
-# 本地手动发布至少要经过：拿到明文令牌 → 写进某处 → 用完再删。
-# 中间任何一步（剪贴板、终端历史、聊天记录、截图）都可能把它漏出去。
-# 少一次经手，就少一个漏点。
+#     403 Two-factor authentication or granular access token with bypass 2fa
+#         enabled is required to publish packages.
 #
-# 触发方式两种，都要人主动点一下 —— 不设「push 即发布」。
-# 打 tag 或合并都不该让一个公开的包悄悄更新。
+# 而 `npm stage publish` 是 npm 为此给的出路，文档原话：
+#
+#   - **不需要 2FA**（"npm stage publish does not require 2FA"）
+#   - **新包也支持**（"for both new and existing packages"；包不存在时
+#     先落一个 `0.0.0-stage` 占位版本）
+#   - 需要 npm CLI ≥11.15.0、Node ≥22.14
+#
+# 于是令牌只够「提交」，不够「上线」。**上线必须有人在 npmjs.com 上
+# 用 2FA 点一次 Approve。** 一道自动流水线上，这一步人为确认不是麻烦，
+# 是它唯一的价值所在 —— 尤其对一个要往 npm 写公开包的工具。
+#
+# 为什么不用可信发布（OIDC，完全不要令牌）：
+# 它要在 **npm 上的包设置页**配置，而包还不存在，没有那一页。
+# 等 1.1.1 上线后就可切过去，届时这个 secret 可以删掉。
 
 on:
-  # 手动触发（推荐）。可以选先干跑一次看清楚要发什么。
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: '只干跑（npm publish --dry-run），不真的发布'
-        type: boolean
-        default: true
-  # 也可以在 GitHub 上发一个 Release 来触发。
+      mode:
+        description: '做什么'
+        type: choice
+        default: stage
+        options:
+          - stage        # 提交待审（默认，最安全）
+          - dry_run      # 只干跑，什么都不提交
+          - direct       # 直接发布（需要 bypass-2FA 令牌，npm 正在淘汰）
   release:
     types: [published]
 
 permissions:
   contents: read
-  # npm 的「来源证明」（provenance）需要它：让 npm 上的包页显示
+  # npm 的「来源证明」（provenance）需要它：npm 包页会显示
   # 「这个包是在这条 workflow、这个 commit 上构建的」。
-  # 对一个主打「索引不出机器」的工具来说，这一条比加速下载更有意义。
+  # 对一个主打「索引不出机器」的工具，这一条比加速下载更有意义。
   id-token: write
 
 jobs:
@@ -55,26 +68,28 @@ jobs:
           npm pack --dry-run 2>&1 | tail -30
 
       - name: 发布前先跑全部测试
-        # 发布是单向的：npm 不允许覆盖已发布的版本号（`npm unpublish` 有严格限制）。
+        # 发布是单向的：npm 不允许覆盖已发布的版本号。
         # 所以「先测试再发布」不是流程洁癖，是因为**发出去就收不回来**。
         run: npm test
 
       - name: 检查 secret 在不在
-        # 缺 secret 时给出人话，而不是让 npm 抛一个 E401 让人去猜。
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
             echo "::error::仓库 secret 里没有 NPM_TOKEN，或者它的值是空的。"
             echo "去 Settings → Secrets and variables → Actions 加一个，"
-            echo "值必须是 npmjs.com 上生成的令牌，不是这个页面的示例占位符。"
+            echo "值必须是 npmjs.com 上生成的令牌，不是那个页面的示例占位符。"
             exit 1
           fi
 
       - name: 确认 npm 没有偷偷改我们的发布清单
-        # `npm test` 里已经有一条同名检查，这里**再挡一次**是故意的：
-        # 测试可能被人从链子上摘掉，而这一条在发布这条路径上，摘不掉。
-        working-directory: mcp-server
+        # `npm test` 里已有一条同名检查（会真跑一次 --dry-run）。这里再挡一次是故意的：
+        # 测试可能被人从链子上摘掉，而这一条在发布这条路上，摘不掉。
+        #
+        # 背景：`"bin": {"localvault": "./cli.js"}` 里那个 `./` 会被 npm 判为
+        # invalid 并从清单里删掉 —— 装完没有任何命令可跑，而这条警告
+        # **只在 publish 时出现，npm pack 不报**。
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -86,21 +101,46 @@ jobs:
             exit 1
           fi
 
-      - name: 干跑（不发布）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      # ── 三条路，只走一条 ──────────────────────────────────────────
+      - name: 干跑（什么都不提交）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'dry_run' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --dry-run --provenance --access public
 
-      - name: 真的发布
-        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
+      - name: 提交待审（stage）
+        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'stage') }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
-
-      - name: 发布结果
-        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run) }}
         run: |
-          echo "已发布。确认一下："
-          sleep 5
-          npm view "$(node -p "require('./package.json').name")" version dist.tarball 2>&1 || true
+          npm stage publish --provenance --access public
+          echo ""
+          echo "== 当前待审列表 =="
+          npm stage list || true
+
+      - name: 直接发布（deprecated 路线）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'direct' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "::warning::direct 路线需要 bypass-2FA 令牌，npm 正在淘汰它（2027-01 起失效）。"
+          echo "::warning::除非确认需要，请用 stage。"
+          npm publish --provenance --access public
+
+      - name: 下一步要人做什么
+        if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'stage') }}
+        run: |
+          {
+            echo "## 已提交待审，还差最后一步"
+            echo ""
+            echo "这个包**还没有上线**。需要你本人用 2FA 批准一次："
+            echo ""
+            echo "1. 打开 https://www.npmjs.com/ → 头像 → **Staged Packages**"
+            echo "2. 找到 \`$(node -p "require('./package.json').name")\`，点 **Approve**"
+            echo "3. 按提示输 2FA 验证码"
+            echo ""
+            echo "批准之后，这个版本才会出现在 registry 上。"
+            echo ""
+            echo "> 首次发布时 npm 会先落一个 \`0.0.0-stage\` 占位版本 —— 那是正常的，"
+            echo "> 真正的内容要等你批准才公开。"
+          } >> "$GITHUB_STEP_SUMMARY"
