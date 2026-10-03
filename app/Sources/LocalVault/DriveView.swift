@@ -354,23 +354,18 @@ struct DriveView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        let group = DispatchGroup()
-        var urls: [URL] = []
-        let lock = NSLock()
-        for p in providers where p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-            group.enter()
-            p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
-                defer { group.leave() }
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                lock.lock(); urls.append(url); lock.unlock()
+        // 收集逻辑在 `FileDrop`，那里有一段实测记录说明**为什么不能在主线程上等**。
+        // 一句话：`NSItemProvider` 的回调要靠主线程的 run loop 投递，
+        // 在主线程 `wait` 它等于堵住自己，必然超时 → 拖进去没反应 + 拖拽影子卡住。
+        FileDrop.collectURLs(from: providers) { urls in
+            guard !urls.isEmpty else {
+                // 以前这里是静默的 `return false`：界面亮一下就没动静，
+                // 用户只能猜「是不是不支持拖拽」。说不出来至少要说一声。
+                withAnimation(Motion.base) { lastDrop = "没读到拖进来的内容，试试「选文件…」" }
+                return
             }
+            ingest(urls)
         }
-        // 拖拽回调在主线程；这里等一小会儿收集 URL，再把复制放到后台
-        _ = group.wait(timeout: .now() + 3)
-        guard !urls.isEmpty else { return false }
-        DispatchQueue.main.async { ingest(urls) }
-        return true
     }
 
     private func ingest(_ urls: [URL]) {

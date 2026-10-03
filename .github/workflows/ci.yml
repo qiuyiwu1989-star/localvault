@@ -48,6 +48,11 @@ jobs:
         working-directory: mcp-server
         run: npm test
 
+      - name: 拖拽收集（App，headless）
+        # 手拖验不出来的那类 bug：主线程 wait NSItemProvider 的回调必然超时。
+        # 这条只编 FileDrop.swift + 测试，不依赖完整 App 构建。
+        run: sh scripts/file-drop-check.sh
+
       - name: Swift 编译（Release）
         working-directory: app
         run: swift build -c release

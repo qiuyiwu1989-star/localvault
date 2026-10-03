@@ -142,6 +142,13 @@ step "提醒：本地 Swift 与 CI 的版本差异" bash -c '
 # 「源码修了、dist/ 没重编」，产物因此内部自相矛盾。
 step "跨索引器对拍（CLI vs App 逐字段）" sh "$HERE/cross-indexer-check.sh"
 
+# 拖拽收集：守一个**手拖验不出来**的 bug —— 在主线程上 wait NSItemProvider
+# 的回调（回调要靠主线程 run loop 投递，等它就是堵住自己）。
+# 界面表现是「投放区亮一下、松手没反应、拖拽影子卡在屏幕上」，
+# 而那三种症状能对应的原因有十几种。这里压成两条可断言的：
+# 同步调用必须立刻返回、回调必须真的到达。
+step "拖拽收集（App，headless）" sh "$HERE/file-drop-check.sh"
+
 # 自检那一步：造语料 → 建库 → 自检 → 比对数据目录指纹
 selftest_step() {
   cd "$REPO/app" || return 1
