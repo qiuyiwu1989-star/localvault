@@ -32,18 +32,28 @@ const STAGE = Object.freeze({
 /** 从工具返回里抠出 source_id / job_id —— 服务端形状未核查，所以写得宽容。 */
 function extractReceipt(result) {
   const out = { sourceId: null, jobId: null, raw: result };
-  const seen = [];
-  const walk = (v) => {
-    if (!v || typeof v !== 'object') return;
+  const seen = new Set();
+  const walk = (v, depth) => {
+    if (depth > 8 || !v || typeof v !== 'object' || seen.has(v)) return;
+    seen.add(v);
     for (const [k, val] of Object.entries(v)) {
       if (typeof val === 'string') {
         if (/^source_?id$/i.test(k) && !out.sourceId) out.sourceId = val;
         if (/^job_?id$/i.test(k) && !out.jobId) out.jobId = val;
-      } else if (typeof val === 'object') walk(val);
-      seen.push(k);
+        // 真正的返回体被塞在 `content[].text` 里 —— **一个 JSON 字符串**。
+        // 只在键名上匹配是不够的：那时 `source_id` 是个字符串的**内容**，
+        // 不是键，所以永远抠不到，账本里 sourceId/jobId 永远是 null。
+        //
+        // 我原来的假端点直接返回扁平对象 `{source_id, job_id}`，
+        // 于是这条路径一次都没被走过 —— 测试的假服务器形状不像真服务器，
+        // 是「测试发现不了自己的 bug」的典型。
+        if (val.trim().startsWith('{')) {
+          try { walk(JSON.parse(val), depth + 1); } catch { /* 不是 JSON 就算了 */ }
+        }
+      } else if (typeof val === 'object') walk(val, depth + 1);
     }
   };
-  walk(result);
+  walk(result, 0);
   return out;
 }
 
@@ -142,6 +152,8 @@ function newBridge({ db, ledger, manifest, client, log = () => {} }) {
             // 结果不明 / 暂时性：状态不动，只涨次数 —— 下次补偿用**原样 payload** 重发
             L.bumpAttempt(ledger, src, e.kind, e.message);
           } else {
+            // 含工具级拒绝（kind='tool'）：记失败，**不记收据**。
+            // 游标因为有失败而不推进，下次 push 会重新遇到这批。
             L.markFailed(ledger, src, e.kind || 'validation', e.message);
           }
           stats.failed++; hadFailure = true;

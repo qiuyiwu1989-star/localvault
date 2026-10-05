@@ -44,6 +44,25 @@ App 的「提炼」页一直在往 `~/.localvault/claims.db` 写判断，
 > 写一条做不到的验收标准比没有标准更糟：它会让「没验」看起来像「验过了」。
 > 已改成「gone 行里没有误伤」，那条能真正断言。
 
+### 修：中心侧报的四个上游缺陷（三个属实）
+
+记忆中心用真实回环 HTTP 测了 `73be498`，报了四处；逐条探针核实后修了四个：
+
+- **工具级拒绝被当成收据**（最重）：MCP 的工具失败是 HTTP 200 + `result.isError=true`，
+  而客户端只判了 JSON-RPC 的 `error`，不判 `isError`。后果是拒绝被记成收据、游标推进，
+  **那批资料永远不会重发**。现在两个都判。
+- **收据里的 source_id/job_id 存不进账本**：真返回体装在 `content[].text` 里、是个 JSON
+  字符串，而 `extractReceipt` 只在**键名**上匹配，于是永远抠不到。现在会解析 TextContent。
+- **顶层 `parent_source_key` 是本地杜撰的**：来件只把它定义在 `source_metadata`（六个键之一），
+  顶层那个没有依据，而 `validatePayload` 不看未知顶层键 → 静默通过。已删，并加顶层白名单
+  （未知顶层键直接抛错，与 `source_metadata` 的白名单同一纪律）。批次归属改为待确认项。
+- **`utf8JsonLen` 名不副实**：名字说 utf8，实现是 `JSON.stringify().length`（UTF-16 码元），
+  中文低估 2.67 倍。现在真的量字节；`validatePayload` 与 segmenter 用同一把尺子。
+
+根因是**测试的假端点形状不像真端点**（返回扁平对象而不是 `content[].text`），
+所以「解析真实返回体」和「判 200+isError」两条路一次都没被走过。
+假端点已改成真实形状，`test/upstream.js` 从 84 条增至 **96 条**，四条反向证明全部变红。
+
 ### 修：云盘进不了索引，agent 读不到它（App，不影响 npm 包）
 
 把文件拖进云盘后，界面里看得见、盘上也有，但 agent 查不到。

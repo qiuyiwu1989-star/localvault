@@ -39,6 +39,31 @@ class MemoryCenterError extends Error {
   }
 }
 
+/**
+ * 把 MCP 工具结果里的可读文本拼出来 —— 只用于错误信息与拒绝判定。
+ *
+ * MCP 的工具级失败长这样（**HTTP 仍是 200**）：
+ *   {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"..."}],"isError":true}}
+ *
+ * 也就是说「被拒绝」和「成功」在 HTTP 层长得一模一样。不看 `isError`
+ * 就会把拒绝当成功 —— 记上收据、推进游标，然后那一批资料**永远不会重发**。
+ */
+function toolResultText(result) {
+  const out = [];
+  const seen = new Set();
+  const walk = (v, depth) => {
+    if (depth > 8 || !v || typeof v !== 'object' || seen.has(v)) return;
+    seen.add(v);
+    for (const [k, val] of Object.entries(v)) {
+      if (typeof val === 'string') {
+        if (k === 'text' || k === 'message' || k === 'error') out.push(val);
+      } else if (typeof val === 'object') walk(val, depth + 1);
+    }
+  };
+  walk(result, 0);
+  return out.join(' / ').slice(0, 500);
+}
+
 function classify(status, text) {
   if (status === 401 || status === 403) {
     return new MemoryCenterError('auth', `凭据被拒（HTTP ${status}）：停在权限问题上，不换 scope、不重试`, { status });
@@ -151,6 +176,22 @@ class MemoryCenterClient {
       if (rpc.error) {
         const kind = /scope|forbidden|not allowed|unauthor/i.test(rpc.error.message || '') ? 'auth' : 'validation';
         throw new MemoryCenterError(kind, `服务端返回错误：${JSON.stringify(rpc.error).slice(0, 300)}`, { body: rpc.error });
+      }
+      // 工具级拒绝：HTTP 200，但 result.isError === true。
+      // JSON-RPC 层没有 error，所以上面那条判据完全看不见它。
+      //
+      // 这一条是中心侧用真实回环 HTTP 测出来的 —— 我自己的假端点从来没返回过
+      // isError（见 test/upstream.js 的形状保真注释），于是 84 条断言一条都没抓到，
+      // 而 403（传输层拒绝）**替代不了** 200+isError（工具层拒绝）。
+      if (rpc.result && typeof rpc.result === 'object' && rpc.result.isError === true) {
+        const detail = toolResultText(rpc.result);
+        // 说明里提到权限就按权限处理（立刻停、不换 scope）；
+        // 其余一律不重试也不标成功 —— 记失败，游标不许推进。
+        const kind = /scope|forbidden|not allowed|unauthor|permission/i.test(detail) ? 'auth' : 'tool';
+        throw new MemoryCenterError(
+          kind,
+          `工具级拒绝（HTTP 200 但 result.isError=true）：${detail || '(服务端没给说明)'}`,
+          { body: rpc.result });
       }
       return rpc.result;
     }

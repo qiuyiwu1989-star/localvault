@@ -17,8 +17,35 @@
 
 const path = require('path');
 const { stableId, versionHash, sourceKey, originalRef, payloadDigest, messageId, PARSER_VERSION } = require('./versions');
-const { segmentBody, packBatches, MAX_PART_CP } = require('./segmenter');
+const { segmentBody, packBatches, MAX_PART_CP, utf8JsonLen } = require('./segmenter');
 const { resolveRole, resolveAuthor, resolveOriginalDate, resolveSourceType } = require('./roles');
+
+/**
+ * 顶层允许的 `memory_import` 键 —— **只有这些**。
+ *
+ * 为什么要有这张表：原来顶层没有任何白名单，`parent_source_key` 在
+ * `source_metadata` 里出现一次（来件定义的六个键之一），又在**顶层**
+ * 出现一次（`parent_source_key: sk`）—— 同一个名字两个层级，其中顶层那个
+ * 是本地杜撰的，而 `validatePayload` 不看未知顶层键，于是它**静默通过**。
+ *
+ * 这正是本仓库反复踩的那类：拼错一个键，不报错，变成「同步成功但字段丢了」。
+ * 判据要落在「错的那条路走不通」上，所以这里对未知顶层键直接抛错。
+ */
+const ALLOWED_TOP_KEYS = Object.freeze([
+  'scope', 'source_key', 'source_type', 'processing_policy', 'source_metadata', 'messages',
+]);
+
+function assertTopLevel(payload) {
+  for (const k of Object.keys(payload)) {
+    if (!ALLOWED_TOP_KEYS.includes(k)) {
+      throw new Error(
+        `memory_import 不接受顶层字段「${k}」。允许的只有：${ALLOWED_TOP_KEYS.join('、')}。\n` +
+        '  来件只把 parent_source_key 定义在 source_metadata 里；顶层同名键是本地杜撰的，' +
+        '在服务端确认之前不发。'
+      );
+    }
+  }
+}
 
 /** 服务端接受的 source_metadata 键（**只有这六个**）。 */
 const ALLOWED_META_KEYS = Object.freeze([
@@ -119,7 +146,11 @@ function buildImports({ row, text, entry, scope, instance }) {
       // 而我们一批只装一部分消息 —— 所以批次必须能各自被幂等识别。
       // 用 `#p0001` 后缀，重试时同一批仍是同一个 key。
       source_key: `${sk}#p${String(bi + 1).padStart(4, '0')}`,
-      parent_source_key: sk,
+      // 这里原本还有一个顶层 `parent_source_key: sk`。已删。
+      // 来件把 parent_source_key 定义在 source_metadata 里（六个键之一），
+      // 没说顶层也收；而批次归属这件事**从未向中心核实过**。
+      // 未核实就不发 —— 「未知保持未知」，不要用杜撰的字段换一个看起来完整的 payload。
+      // 待确认项：多分段如何归属同一资料？见 记忆中心对接需求-2026-10-05.md R3。
       source_type: sourceType,
       processing_policy: 'archive',
       source_metadata: meta,
@@ -178,13 +209,18 @@ function validatePayload(payload) {
     if (!m.text || m.text.length === 0) problems.push(`消息 ${m.id} 正文为空`);
     if (!['user', 'assistant', 'external'].includes(m.role)) problems.push(`消息 ${m.id} role 非法：${m.role}`);
   }
-  const json = JSON.stringify(payload.messages);
-  if (json.length > 24000) problems.push(`messages JSON ${json.length} > 24000`);
+  try { assertTopLevel(payload); } catch (e) { problems.push(e.message); }
+  // 用与服务端同一把尺子：UTF-8 字节。原来这里是 `.length`（UTF-16 码元），
+  // 与 segmenter 的 `tooLong` 判据还不一致 —— 校验和分段量的是两个不同的东西。
+  const n = utf8JsonLen(payload.messages);
+  if (n > 24000) problems.push(`messages JSON ${n} 字节 > 24000`);
   try { assertMeta(payload.source_metadata || {}); } catch (e) { problems.push(e.message); }
   return problems;
 }
 
 module.exports = {
+  ALLOWED_TOP_KEYS,
+  assertTopLevel,
   ALLOWED_META_KEYS,
   MAX_META_VALUE,
   buildImports,

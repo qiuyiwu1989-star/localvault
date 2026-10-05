@@ -61,9 +61,27 @@ function section(t) { console.log(`\n${t}`); }
 /* ------------------------------------------------------------------ *
  * 假端点：记录收到的每一个 payload，可以按脚本失败
  * ------------------------------------------------------------------ */
+/**
+ * 真实 MCP 工具结果的形状：返回体装在 `content[].text` 里，**是个 JSON 字符串**。
+ *
+ * 原来这里直接返回扁平对象 `{source_id, job_id}`，于是
+ * `extractReceipt` 的「解析 TextContent」那条路一次都没被走过 ——
+ * 测试的假服务器形状不像真服务器，是「测试发现不了自己的 bug」的典型。
+ * 中心侧用真实回环 HTTP 一测就测出来了。
+ */
+function toolResult(obj) {
+  return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
+}
+
+/** 工具级失败：**HTTP 仍然是 200**，只有 `isError` 标记它是失败。 */
+function toolError(msg) {
+  return { content: [{ type: 'text', text: msg }], isError: true };
+}
+
 function makeFakeServer(script = {}) {
   const received = [];
-  const state = { mode: 'ok', failTimes: 0, failKind: 'transient' };
+  const state = { mode: 'ok', failTimes: 0, failKind: 'transient',
+                  toolErrorTimes: 0, toolErrorText: '工具级拒绝（默认文案）' };
   const fetchImpl = async (url, init) => {
     const body = JSON.parse(init.body);
     if (body.method === 'initialize') {
@@ -91,18 +109,26 @@ function makeFakeServer(script = {}) {
 
       if (name === 'memory_import') {
         if (args.processing_policy !== 'archive') return jsonRes({ error: 'policy not allowed' }, 400);
-        return jsonRes({ jsonrpc: '2.0', id: body.id, result: {
+        // 工具级拒绝：HTTP 200，result.isError = true
+        if (state.toolErrorTimes > 0) {
+          state.toolErrorTimes--;
+          return jsonRes({ jsonrpc: '2.0', id: body.id, result: toolError(state.toolErrorText) });
+        }
+        // 真实形状：收据在 content[].text 那个 JSON 字符串里
+        return jsonRes({ jsonrpc: '2.0', id: body.id, result: toolResult({
           source_id: `src-${received.length}`, job_id: `job-${received.length}`, status: 'archived',
-        } });
+        }) });
       }
       if (name === 'memory_import_status') {
-        return jsonRes({ jsonrpc: '2.0', id: body.id, result: { archived: true, indexed: true, extracted: false, confirmed: false } });
+        return jsonRes({ jsonrpc: '2.0', id: body.id, result: toolResult({ archived: true, indexed: true, extracted: false, confirmed: false }) });
       }
       return jsonRes({ error: 'unknown tool' }, 400);
     }
     return jsonRes({ jsonrpc: '2.0', id: body.id, result: {} });
   };
-  return { fetchImpl, received, state, setFail(n, kind) { state.failTimes = n; state.failKind = kind; } };
+  return { fetchImpl, received, state,
+    setFail(n, kind) { state.failTimes = n; state.failKind = kind; },
+    setToolError(n, text) { state.toolErrorTimes = n; if (text) state.toolErrorText = text; } };
 }
 
 function jsonRes(obj, status = 200) {
@@ -485,6 +511,82 @@ async function main() {
       source_metadata: { original_ref: 'r' },
     });
     check('dry-run 自检会抓出非 archive 的 policy', probs2.some((p) => /archive/.test(p)), probs2.join('；'));
+  }
+
+  /* ---------- §6b 工具级拒绝 / 收据形状 / 长度判据 ---------- */
+  section('§6b 工具级拒绝（HTTP 200 + isError）不得被记成收据');
+  {
+    const { S, Map: MP } = loadModules();
+
+    // ① 权限类工具拒绝 → 立刻停，不记收据，游标不动
+    const sA = makeFakeServer();
+    sA.setToolError(1, 'not allowed: scope agent:localvault-inbox cannot import into personal');
+    const fxA = buildIndexedFixture('tooldeny-a');
+    fxA.write('a.md', '内容。'); fxA.reindex();
+    const bA = makeBridge({ fx: fxA, server: sA, ledgerFile: path.join(fxA.base, 'la.db'),
+      manifestRaw: { scope: 'agent:localvault-inbox', instance: 'tooldeny-a', sources: [{ path: 'a.md', role: 'user' }] } });
+    const rA = await bA.bridge.push();
+    check('权限类工具拒绝：receipted 为 0（拒绝没被当成收据）', rA.receipted === 0,
+      JSON.stringify(rA).slice(0, 220));
+    check('权限类工具拒绝：游标不推进', rA.cursorAdvanced === false, `advanced=${rA.cursorAdvanced}`);
+    const rowsA = bA.ledger.prepare('SELECT stage FROM submissions').all();
+    check('权限类工具拒绝：账本里有行，且没有一行是 receipted',
+      rowsA.length > 0 && rowsA.every((r) => r.stage !== 'receipted'),
+      `stage=${rowsA.map((r) => r.stage).join(',') || '(空)'}`);
+    bA.ledger.close();
+
+    // ② 非权限类工具拒绝 → 记失败、游标不动（不是静默丢弃）
+    const sB = makeFakeServer();
+    sB.setToolError(1, '参数校验失败：messages 为空');
+    const fxB = buildIndexedFixture('tooldeny-b');
+    fxB.write('b.md', '内容。'); fxB.reindex();
+    const bB = makeBridge({ fx: fxB, server: sB, ledgerFile: path.join(fxB.base, 'lb.db'),
+      manifestRaw: { scope: 'agent:localvault-inbox', instance: 'tooldeny-b', sources: [{ path: 'b.md', role: 'user' }] } });
+    const rB = await bB.bridge.push();
+    check('普通工具拒绝：receipted 为 0', rB.receipted === 0, JSON.stringify(rB).slice(0, 220));
+    check('普通工具拒绝：游标不推进', rB.cursorAdvanced === false, `advanced=${rB.cursorAdvanced}`);
+    const rowsB = bB.ledger.prepare('SELECT stage FROM submissions').all();
+    check('普通工具拒绝：被记成 failed（可补偿，不是静默丢弃）',
+      rowsB.some((r) => r.stage === 'failed'), `stage=${rowsB.map((r) => r.stage).join(',') || '(空)'}`);
+    bB.ledger.close();
+
+    // ③ 收据在 content[].text 的 JSON 里 —— 必须真的抠出来并落盘
+    const sC = makeFakeServer();
+    const fxC = buildIndexedFixture('receipt-shape');
+    fxC.write('c.md', '内容。'); fxC.reindex();
+    const bC = makeBridge({ fx: fxC, server: sC, ledgerFile: path.join(fxC.base, 'lc.db'),
+      manifestRaw: { scope: 'agent:localvault-inbox', instance: 'receipt-shape', sources: [{ path: 'c.md', role: 'user' }] } });
+    const rC = await bC.bridge.push();
+    const rowC = bC.ledger.prepare('SELECT stage, source_id, job_id FROM submissions LIMIT 1').get();
+    check('收据被抠出来了（source_id 非空）', Boolean(rowC && rowC.source_id), JSON.stringify(rowC));
+    check('job_id 也落进了账本', Boolean(rowC && rowC.job_id), JSON.stringify(rowC));
+    check('正常形状下仍然记成 receipted', rC.receipted > 0 && Boolean(rowC) && rowC.stage === 'receipted',
+      JSON.stringify(rowC));
+    bC.ledger.close();
+
+    // ④ 顶层白名单：杜撰的顶层键必须**抛错**，不能静默通过
+    const probs = MP.validatePayload({
+      scope: 'agent:localvault-inbox', source_key: 'k', source_type: 'document',
+      processing_policy: 'archive', source_metadata: {},
+      messages: [{ id: 'p1', role: 'user', text: 'x' }],
+      parent_source_key: '本地杜撰的顶层键',
+    });
+    check('顶层杜撰字段（parent_source_key）被拒绝', probs.some((x) => /顶层字段/.test(x)),
+      probs.join('；') || '(竟然没报错)');
+    const clean = MP.validatePayload({
+      scope: 'agent:localvault-inbox', source_key: 'k', source_type: 'document',
+      processing_policy: 'archive', source_metadata: {},
+      messages: [{ id: 'p1', role: 'user', text: 'x' }],
+    });
+    check('白名单内的正常 payload 不被误伤', clean.length === 0, clean.join('；'));
+
+    // ⑤ 长度判据必须是 UTF-8 字节（按码元数会低估 2.67 倍）
+    const cjk = { t: '中文测试'.repeat(10) };
+    const byChars = JSON.stringify(cjk).length;
+    const byBytes = Buffer.byteLength(JSON.stringify(cjk), 'utf8');
+    check('utf8JsonLen 数的是字节，不是 UTF-16 码元',
+      S.utf8JsonLen(cjk) === byBytes && byBytes > byChars,
+      `函数=${S.utf8JsonLen(cjk)} 字节=${byBytes} 码元=${byChars}`);
   }
 
   /* ---------- §7 删除 ---------- */

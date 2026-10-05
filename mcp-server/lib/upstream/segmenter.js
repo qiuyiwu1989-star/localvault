@@ -37,8 +37,19 @@ const MAX_BATCH_JSON_CHARS = 24000;
  */
 const MAX_PART_CP = 6000;
 
+/**
+ * 序列化后的 **UTF-8 字节数**。
+ *
+ * 原来这函数叫 `utf8JsonLen` 却返回 `JSON.stringify(obj).length` ——
+ * 那是 **UTF-16 码元数**，对中文低估 2.67 倍，对 emoji 低估 2 倍。
+ * 于是「每一段都不超预算」这条断言在库里是绿的，而真实发出去的东西
+ * 可能超限 2.67 倍。名字说 utf8、实现不是 utf8，比没有这个函数更糟。
+ *
+ * 现在真的量字节。字节数 ≥ 码元数，所以判据落在**保守的那一侧**：
+ * 宁可多切一段，也不少算长度。
+ */
 function utf8JsonLen(obj) {
-  return JSON.stringify(obj).length;   // JSON.stringify 输出的是 UTF-16 码元数
+  return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
 
 /**
