@@ -149,6 +149,12 @@ step "跨索引器对拍（CLI vs App 逐字段）" sh "$HERE/cross-indexer-chec
 # 同步调用必须立刻返回、回调必须真的到达。
 step "拖拽收集（App，headless）" sh "$HERE/file-drop-check.sh"
 
+# 云盘能不能被 agent 读到：守的是一句承诺。
+# 云盘自己的说明写着「拖进来之后会被读到」，而它从不在索引根里 ——
+# 于是 find_files 查不到、read_text 回「路径不在任何已配置索引根内」。
+# 这条同时验配置层（幂等、不冲掉用户手写的键）与端到端（真实索引 + 真实 MCP 查询）。
+step "云盘可读性（App + 真实 MCP，端到端）" sh "$HERE/drive-index-check.sh"
+
 # 自检那一步：造语料 → 建库 → 自检 → 比对数据目录指纹
 selftest_step() {
   cd "$REPO/app" || return 1

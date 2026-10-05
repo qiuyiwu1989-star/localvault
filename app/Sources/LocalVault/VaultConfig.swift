@@ -189,6 +189,29 @@ struct VaultConfig {
         try out.write(to: url, options: .atomic)
     }
 
+    // MARK: - 增
+
+    /// 确保某个目录在 `roots` 里（幂等）。返回**这次是不是真的加了**。
+    ///
+    /// - 已经在里面：什么都不做，**不动它的位置**。用户可能手动调过顺序，
+    ///   重排等于替他把决定改掉。
+    /// - 不在里面：追加到末尾，走同一套「读旧文件 → 只覆盖自己拥有的四个键 →
+    ///   其余原样带走」的写盘路径，所以不会冲掉 `policy` / `ignoredDirs` / `denyRead`。
+    ///
+    /// 不写 `priority`：`config.js` 对没有 `priority` 的根按 `10 + i*10` 补默认值，
+    /// 这个根排在末尾就自然是 40。在 Swift 这里再存一份默认值，等于把
+    /// `config.js` 的表复制到 App 侧 —— 上面那段注释说过的分叉来源。
+    @discardableResult
+    static func ensureRoot(path: String, label: String) throws -> Bool {
+        var cfg = load() ?? VaultConfig.empty
+        let abs = expandHome(path)
+        if cfg.roots.contains(where: { $0.path == abs }) { return false }
+        cfg.roots.append(Root(path: abs, label: label))
+        if cfg.primaryRoot.isEmpty { cfg.primaryRoot = cfg.roots[0].path }
+        try cfg.save()
+        return true
+    }
+
     // MARK: - 路径
 
     /// `~` / `~/x` → 绝对路径。空串原样返回（别把空串变成 cwd）。

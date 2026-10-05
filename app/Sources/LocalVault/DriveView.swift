@@ -23,6 +23,7 @@ struct DriveView: View {
     @State private var dropTargeted = false
     @State private var lastDrop = ""
     @State private var newFolderName = ""
+    @State private var driveRootChecked = false   // 云盘只在本次会话里登记一次
 
     /// 放进去的目标。没选中任何文件夹时兜底说「根目录」（`DriveStore` 会落到第一个默认文件夹）
     private var targetName: String { picked ?? "根目录" }
@@ -331,9 +332,37 @@ struct DriveView: View {
 
     private func reload() {
         DriveStore.ensureStructure()
+        registerDriveRootOnce()
         folders = DriveStore.folders()
         if picked == nil { picked = folders.first?.name }
         items = DriveStore.list(sub: picked)
+    }
+
+    /// 把云盘登记成索引根 —— 只在本次会话里做一次。
+    ///
+    /// 不做的话，`说明.md` 那句「拖进来之后在被索引时会自动被读到」永远不会成立：
+    /// 云盘不在 `roots` 里，索引器就不扫它，MCP 对它的回答是
+    /// 「路径不在任何已配置索引根内，拒绝读取」。
+    ///
+    /// 放在 `reload()` 里是因为它紧跟在 `ensureStructure()` 后面 —— 目录刚建好，
+    /// 登记它才指向一个真实存在的路径。用一次性标志挡住，免得每切一次子目录
+    /// 就读一遍配置文件。
+    private func registerDriveRootOnce() {
+        guard !driveRootChecked else { return }
+        driveRootChecked = true
+        do {
+            if try DriveIndex.register() {
+                // 刚加进来，里面可能已经有东西 → 立刻扫一次，
+                // 不用等用户下次拖东西或者手动重扫。
+                reindexDrive(note: "已把云盘加为索引根")
+            }
+        } catch {
+            // 配置写不进去要**说出来**：用户以为通了、实际没通，
+            // 就是这次修的这类问题。写不进去时云盘仍然可用，只是 agent 读不到。
+            withAnimation(Motion.base) {
+                lastDrop = "云盘没能登记成索引根，agent 暂时读不到它：\(error.localizedDescription)"
+            }
+        }
     }
 
     private func createFolder() {
@@ -375,6 +404,39 @@ struct DriveView: View {
             DispatchQueue.main.async {
                 reload()
                 withAnimation(Motion.base) { lastDrop = r.message }
+            }
+            // 复制完就扫一次，让「拖进去 → agent 立刻查得到」这条真的成立。
+            // 光复制是不够的：索引是快照，不扫的话文件在界面里、在盘上，
+            // 但 `find_files` 查不到 —— 那正是这句承诺以前不成立的方式。
+            //
+            // 只在**真的放进去过**文件时才扫。全部失败还去扫，等于每次失败都
+            // 白扫一遍盘，还会把「没扫到」误显示成「扫到了 0 个」。
+            guard r.ok > 0 else { return }
+            self.reindexDrive(note: "已放入 \(r.ok) 个文件")
+        }
+    }
+
+    /// 扫云盘这一个根，扫完把**从索引里回查到的数字**报给用户。
+    ///
+    /// 刻意不用扫描报告里的「扫到 N 个」：那是扫描侧的数字，
+    /// 证明不了这些行真的查得出来（根没登记对、路径归一化不同、
+    /// 被忽略规则挡掉，扫描都照样报 N）。用户关心的是「agent 现在能不能看到」，
+    /// 所以报的是同一份索引里回查出来的条数。
+    private func reindexDrive(note: String) {
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let rep = try DriveIndex.reindex()
+                DispatchQueue.main.async {
+                    withAnimation(Motion.base) {
+                        lastDrop = "\(note)，云盘已重新索引（扫到 \(rep.filesSeen) 个）"
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    withAnimation(Motion.base) {
+                        lastDrop = "\(note)，但重新索引失败：\(error.localizedDescription)"
+                    }
+                }
             }
         }
     }
@@ -713,6 +775,17 @@ enum DriveStore {
             - **我的文档** —— 关于你个人的：笔记、方案、简历、汇报
             - **项目资料** —— 跟具体项目有关的
             - **参考素材** —— 图片、音视频、参考资料（这类机器读不懂，但你可以归类）
+
+            ## agent 怎么读到你放的东西
+
+            这个文件夹会被登记成**索引根**，所以放进来的东西 agent 查得到：
+
+            - 拖进 App 窗口 / 点「选文件…」放进去后，**会自动重新索引一次**，
+              不需要你再点按钮
+            - 之后 agent 用 `find_files` 搜得到、用 `read_text` 读得到，
+              `list_directory` 也看得到这个目录
+
+            放进来之前 agent 是看不到的 —— 索引只覆盖登记过的目录，云盘就是其中之一。
 
             ## 现在还没有的功能
 

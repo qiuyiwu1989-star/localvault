@@ -1399,6 +1399,68 @@ final class VaultStore: ObservableObject {
         check("云盘：文件夹名里的 .. 不会逃出根目录",
               !FileManager.default.fileExists(atPath: escaped.path))
 
+        // ── 云盘登记成索引根之后，App 自己的索引器真的能把它扫进来 ──
+        //
+        // 补的是「云盘可读性」里 App 的那一半：`scripts/drive-index-check.sh`
+        // 验了配置层与 JS/MCP 侧，但没验 App 自己的 `VaultIndexer` 扫云盘这个根。
+        //
+        // 重点不是「扫得到」，而是**只扫一个根时别的根一行都不能被动**。
+        // 往云盘里拖文件触发的是「只扫云盘」的增量扫描（`DriveIndex.reindex`）；
+        // 如果消失标记不按根隔离，那一次扫描会把工作区那 9000 多个文件全标成 gone ——
+        // 而界面上只会说「已重新索引」。所以这条要真建两个根、只扫其中一个、再对拍另一个。
+        do {
+            let rootWork = tmp.appendingPathComponent("根-工作区")
+            let rootDrive = tmp.appendingPathComponent("根-云盘")
+            for (r, names) in [(rootWork, ["甲.md", "乙.md"]), (rootDrive, ["丙.md"])] {
+                try? FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+                for n in names {
+                    _ = FileManager.default.createFile(
+                        atPath: r.appendingPathComponent(n).path,
+                        contents: Data("内容".utf8))
+                }
+            }
+            let twoDb = tmp.appendingPathComponent("两个根.db").path
+            let scanRoots: ([URL]) -> Bool = { urls in
+                (try? VaultIndexer.ensureDatabase(at: twoDb)) != nil
+                    && (try? VaultIndexer.run(
+                        roots: urls.map { VaultIndexer.IndexRoot(path: $0.path, label: $0.lastPathComponent) },
+                        dbPath: twoDb, onProgress: { _ in })) != nil
+            }
+            let q: (String) -> Int = { sql in Int(VaultQuery.scalar(dbPath: twoDb, sql: sql)) }
+
+            let bothScanned = scanRoots([rootWork, rootDrive])
+            check("App 的索引器能扫这两个根", bothScanned,
+                  bothScanned ? "" : "VaultIndexer.run 抛错了")
+            if bothScanned {
+                let workBefore = q("SELECT count(*) FROM files WHERE root = '\(rootWork.path)' AND gone = 0")
+                let driveBefore = q("SELECT count(*) FROM files WHERE root = '\(rootDrive.path)' AND gone = 0")
+                check("两个根各自的文件都进库了（工作区 2 / 云盘 1）",
+                      workBefore == 2 && driveBefore == 1, "\(workBefore) / \(driveBefore)")
+
+                // 只扫云盘 —— 这正是往云盘里拖文件时走的那条路
+                _ = scanRoots([rootDrive])
+
+                let workGone = q("SELECT count(*) FROM files WHERE root = '\(rootWork.path)' AND gone = 1")
+                let workAfter = q("SELECT count(*) FROM files WHERE root = '\(rootWork.path)' AND gone = 0")
+                check("只扫云盘时，别的根一个都没被标成 gone", workGone == 0,
+                      workGone == 0 ? "" : "\(workGone) 个被误标 —— 一次拖拽会毁掉整个索引")
+                // 前置量必须一起断言。只比「前后相等」的话，坏实现把 workBefore
+                // 一起弄成 0 时，这条就变成「0 == 0」而**照样通过** —— 实测过：
+                // 去掉 `WHERE root = ?` 之后它报「0 → 0 ✓」，空断言冒充了覆盖率。
+                check("只扫云盘时，别的根行数不变",
+                      workBefore == 2 && workAfter == workBefore,
+                      "\(workBefore) → \(workAfter)")
+
+                // 反过来：云盘里真删掉的文件**必须**被标出来。
+                // 少了这条，「按根隔离」退化成「谁都不标记」也照样绿。
+                try? FileManager.default.removeItem(at: rootDrive.appendingPathComponent("丙.md"))
+                _ = scanRoots([rootDrive])
+                let driveGone = q("SELECT count(*) FROM files WHERE root = '\(rootDrive.path)' AND gone = 1")
+                check("云盘里真删掉的文件会被标成 gone（隔离 ≠ 不标记）", driveGone == 1,
+                      "\(driveGone) 个")
+            }
+        }
+
         try? FileManager.default.removeItem(at: tmp)
 
         // 只读证明：对 vault.db 执行写操作必须失败。

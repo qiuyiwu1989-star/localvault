@@ -53,6 +53,11 @@ jobs:
         # 这条只编 FileDrop.swift + 测试，不依赖完整 App 构建。
         run: sh scripts/file-drop-check.sh
 
+      - name: 云盘可读性（App + 真实 MCP，端到端）
+        # 云盘不在索引根里 → agent 读不到它。这条验「登记成索引根之后真的读得到」，
+        # 走真实索引 + 真实 MCP 协议查询，全程在临时主目录里。
+        run: sh scripts/drive-index-check.sh
+
       - name: Swift 编译（Release）
         working-directory: app
         run: swift build -c release
